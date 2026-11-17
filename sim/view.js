@@ -219,7 +219,7 @@
     lines.hdmi.plug(Boolean(state.video));
     lines.hdmi.style.display = state.video ? '' : 'none';
     labels.eth0.textContent = 'ETH0 · network';
-    labels.eth1.textContent = state.eth1 ? 'ETH1 · laptop' : 'ETH1 · click to plug in a laptop';
+    labels.eth1.textContent = state.eth1 ? 'ETH1 · laptop' : 'ETH1 · click to plug in';
     labels.usb.textContent = bat ? { none: 'USB-C1 · click to plug in', charger: 'USB-C1 · charger',
                                      device: 'USB-C1 · charging a phone' }[cableIn] : '';
     labels.hdmi.textContent = state.video ? 'HDMI · monitor window' : '';
