@@ -12,6 +12,8 @@ import argparse
 import base64
 import gzip
 import hashlib
+import http.client as http_client
+import http.server as http_server
 import json
 import os
 import platform
@@ -394,6 +396,11 @@ class Instance:
             raise Fail(f"instance '{self.name}' is not running; start it with `f1emu start`")
 
     def url(self, path=""):
+        """The device's own web server, as forwarded by QEMU: what the commands talk to."""
+        return f"http://127.0.0.1:{self.state.get('guest_port', self.state['port'])}/{path}"
+
+    def view_url(self, path=""):
+        """The address a person opens: the view proxy, which sharpens the panel."""
         host = self.state["listen"]
         return f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{self.state['port']}/{path}"
 
@@ -498,7 +505,7 @@ def qemu_command(inst, meta, entry, boot, opts):
     # timer and panics, hence acpi=off. hvc0 is listed last so systemd logs there.
     append = (f"root=UUID={meta['fsid']} rootflags=subvol=@{entry['profile']} rw rootwait "
               f"console=tty0 console=hvc0 {credentials(ssh_public_key())} {opts['append']}").strip()
-    forwards = [f"hostfwd=tcp:{opts['listen']}:{opts['port']}-:8899", f"hostfwd=tcp:127.0.0.1:{opts['ssh_port']}-:22"]
+    forwards = [f"hostfwd=tcp:127.0.0.1:{opts['guest_port']}-:8899", f"hostfwd=tcp:127.0.0.1:{opts['ssh_port']}-:22"]
     for spec in opts["forward"]:
         m = re.fullmatch(r"(\d+):(\d+)(/udp)?", spec)
         if not m:
@@ -545,7 +552,7 @@ def wait_ready(inst, proc, timeout):
 
 
 def open_view(inst, how):
-    url = inst.url()
+    url = inst.view_url()
     if how == "none":
         return
     if how == "app":
@@ -632,7 +639,7 @@ def cmd_start(a):
     conf = settings()
     inst = Instance(a.name)
     if inst.running():
-        say(f"Instance '{inst.name}' is already running at {inst.url()}")
+        say(f"Instance '{inst.name}' is already running at {inst.view_url()}")
         open_view(inst, a.open or conf["open"])
         return
     need("qemu-system-aarch64", "qemu-img", "ssh-keygen")
@@ -667,18 +674,20 @@ def cmd_start(a):
     elif a.disk_size:
         raise Fail("--disk-size only applies when the instance is created; run `f1emu reset` first")
     taken = {p for other in all_instances() if other.name != inst.name and other.running()
-             for p in (other.state["port"], other.state["ssh_port"])}
+             for p in (other.state["port"], other.state["ssh_port"], other.state.get("guest_port"))}
     listen = a.listen or conf["listen"]
     port = free_port(listen, a.port or conf["port"], taken)
+    ssh_port = free_port("127.0.0.1", a.ssh_port or conf["ssh_port"], taken | {port})
     opts = {
-        "listen": listen, "port": port,
-        "ssh_port": free_port("127.0.0.1", a.ssh_port or conf["ssh_port"], taken | {port}),
+        "listen": listen, "port": port, "ssh_port": ssh_port,
+        "guest_port": free_port("127.0.0.1", port + 10000 if port < 55000 else 18899, taken | {port, ssh_port}),
         "memory": a.memory or conf["memory"], "cpus": a.cpus or conf["cpus"],
         "append": a.append or "", "forward": a.forward, "network": not a.no_network,
         "ephemeral": a.ephemeral, "display": a.display, "qemu_arg": a.qemu_arg,
     }
     inst.save(build=meta["name"], variant=meta["variant"], profile=entry["profile"], kernel=entry["version"],
-              port=opts["port"], ssh_port=opts["ssh_port"], listen=listen, ephemeral=a.ephemeral)
+              port=opts["port"], ssh_port=opts["ssh_port"], guest_port=opts["guest_port"], listen=listen,
+              ephemeral=a.ephemeral)
     cmd = qemu_command(inst, meta, entry, boot, opts)
     if a.print_command:
         print(" ".join(f"'{c}'" if " " in c else c for c in cmd))
@@ -705,7 +714,10 @@ def cmd_start(a):
             audio_on(inst, mic)
         except (Fail, subprocess.TimeoutExpired) as e:
             warn(f"no sound: {e}")
-    print(f"    Remote view : {inst.url()}\n    App manager : {inst.url('apps')}\n"
+    with open(inst.dir / "viewer.log", "w") as log:
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_viewer", "-n", inst.name],
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    print(f"    Remote view : {inst.view_url()}\n    App manager : {inst.view_url('apps')}\n"
           f"    Shell       : f1emu ssh{'' if inst.name == 'default' else ' -n ' + inst.name}")
     if opts["port"] != (a.port or conf["port"]):
         warn(f"port {a.port or conf['port']} was busy, using {opts['port']}")
@@ -744,6 +756,7 @@ def cmd_stop(a):
                 if not inst.running():
                     break
                 time.sleep(0.25)
+        run(["pkill", "-f", f"_viewer -n {inst.name}$"], check=False)
         inst.pid_file.unlink(missing_ok=True)
         say(f"Instance '{inst.name}' stopped")
 
@@ -757,7 +770,7 @@ def cmd_status(a):
         s = inst.state
         line = f"{inst.name:12} {'running' if inst.running() else 'stopped':8} build {s['build']:6} {s['profile']:12}"
         if inst.running():
-            line += f" {inst.url()}  ssh :{s['ssh_port']}" + ("  (ephemeral)" if s.get("ephemeral") else "")
+            line += f" {inst.view_url()}  ssh :{s['ssh_port']}" + ("  (ephemeral)" if s.get("ephemeral") else "")
         elif inst.disk.exists():
             line += f" disk {inst.disk.stat().st_size / 1e6:.0f} MB of changes"
         print(line)
@@ -767,7 +780,7 @@ def cmd_open(a):
     inst = Instance(a.name)
     inst.require_running()
     open_view(inst, a.how)
-    print(inst.url())
+    print(inst.view_url())
 
 
 def cmd_ssh(a):
@@ -1037,6 +1050,79 @@ def cmd_purge(a):
     say("Everything removed")
 
 
+VIEW_FIX = b"""
+<script>
+// Added by f1emu. The page stretches its 256x144 canvas with nearest-neighbour
+// sampling, which at any size that is not a whole multiple gives letters uneven
+// strokes. Redraw it at the next whole multiple and let the browser scale that
+// down smoothly instead.
+(() => {
+  const src = document.getElementById('panel');
+  if (!src) return;
+  const dst = document.createElement('canvas');
+  dst.style.cssText = 'position:absolute;z-index:1';
+  for (const k of ['left', 'top', 'width', 'height']) dst.style[k] = src.style[k];
+  src.style.visibility = 'hidden';
+  src.after(dst);
+  const ctx = dst.getContext('2d');
+  const draw = () => {
+    const k = Math.max(1, Math.ceil(dst.getBoundingClientRect().width * devicePixelRatio / src.width));
+    if (dst.width !== src.width * k) { dst.width = src.width * k; dst.height = src.height * k; }
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(src, 0, 0, dst.width, dst.height);
+    requestAnimationFrame(draw);
+  };
+  draw();
+})();
+</script>
+"""
+
+
+def cmd_viewer(a):
+    """Internal: the view proxy. Passes everything to the device, sharpening its front page."""
+    inst = Instance(a.name)
+    state = inst.state
+
+    class Relay(http_server.BaseHTTPRequestHandler):
+        def relay(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) or None
+            upstream = http_client.HTTPConnection("127.0.0.1", state["guest_port"], timeout=120)
+            try:
+                headers = {k: v for k, v in self.headers.items() if k.lower() in ("content-type", "accept")}
+                upstream.request(self.command, self.path, body, headers)
+                res = upstream.getresponse()
+                self.send_response(res.status)
+                for name in ("Content-Type", "Cache-Control"):
+                    if res.getheader(name):
+                        self.send_header(name, res.getheader(name))
+                if self.path.split("?")[0] == "/":
+                    page = res.read() + VIEW_FIX
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
+                # No length: the stream never ends, and HTTP/1.0 lets close mark the end.
+                self.end_headers()
+                while chunk := res.read1(65536):
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except OSError:
+                pass
+            finally:
+                upstream.close()
+
+        do_GET = do_POST = relay
+
+        def log_message(self, *args):
+            pass
+
+    server = http_server.ThreadingHTTPServer((state["listen"], state["port"]), Relay)
+    server.daemon_threads = True
+    server.timeout = 5
+    while inst.running():
+        server.handle_request()
+
+
 def main():
     p = argparse.ArgumentParser(prog="f1emu", description="Run the real Flipper One OS in QEMU on Linux.")
     p.add_argument("--version", action="version", version=VERSION)
@@ -1152,6 +1238,9 @@ def main():
 
     s = add("purge", cmd_purge, "delete all builds, instances and keys", instance=False)
     s.add_argument("-y", "--yes", action="store_true")
+
+    sub.add_parser("_viewer").set_defaults(fn=cmd_viewer, name="default")
+    sub.choices["_viewer"].add_argument("-n", "--name", default="default")
 
     a = p.parse_args()
     if a.cmd == "apps" and a.action != "list" and not a.app:
