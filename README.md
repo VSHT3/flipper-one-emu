@@ -1,14 +1,14 @@
 # f1emu
 
-Run the real Flipper One OS on a Linux PC. One Python file, no root, no WSL.
+Runs Flipper One OS on a Linux PC in QEMU. One Python file, no root.
 
-`f1emu` downloads an official Flipper OS image, reads the kernel out of it,
-boots it in QEMU and opens the device's own remote view in your browser. The
-OS, its menus, the App Manager and hosted apps (Doom included) are the real
-ones from the image; only the hardware is emulated.
+It downloads an official Flipper OS image, reads the kernel out of it, boots
+it and opens the device's remote view in a browser. The OS, menus, App
+Manager and apps come from the image unmodified; only the hardware is
+emulated.
 
-Unofficial. Not affiliated with Flipper Devices. Nothing from Flipper is
-stored in this repository; images come from `dl-linux-images.flipp.dev`.
+Unofficial, not affiliated with Flipper Devices. This repository contains no
+Flipper software; images are downloaded from `dl-linux-images.flipp.dev`.
 
 ## Requirements
 
@@ -71,28 +71,24 @@ Data lives in `~/.local/share/flipper-one-emu`.
   it in user space, so nothing is mounted and no root is needed.
 - QEMU boots `virt` with UEFI and `acpi=off`. The Flipper kernel is
   device-tree only and panics in `time_init` when ACPI tables are present.
-- The image is never modified. Each instance is a qcow2 overlay on top of
-  it, which is what makes factory reset and snapshots cheap.
-- Guest tweaks are passed as systemd credentials on the kernel command line:
-  an SSH key generated for the emulator, and a drop-in for `flipctl.service`
-  that drops the missing `seat1` and selects software rendering. Without it
-  the menus work but no hosted app can start.
+- The image is never modified. Each instance is a qcow2 overlay on top of it.
+- Guest changes are passed as systemd credentials on the kernel command line:
+  an SSH key, and a drop-in for `flipctl.service` that drops the missing
+  `seat1` and selects software rendering. Without the drop-in the menus work
+  but apps do not start.
 
 ## Limits
 
-- On x86 the ARM CPU is emulated in software. Menus are fine, heavy apps are
-  slow. On an ARM64 host with KVM it runs natively (untested).
-- No Wi-Fi, modem, battery, GPIO, sound or microphone: the kernel has no
-  drivers for anything QEMU could offer there. Ethernet works through NAT.
-- Only the 256x144 panel is shown. The Desktop and TV profiles boot, but
-  their HDMI output has no screen.
-- The vendor 6.1 kernel has no virtio drivers and cannot boot; the mainline
-  kernel is used.
-- Flipper publishes development builds several times a day. A new one may
-  change the layout this tool relies on; pin `build` if that happens.
+- On x86 the ARM CPU is emulated in software. KVM on an ARM64 host is wired
+  up but untested.
+- No Wi-Fi, modem, battery, GPIO, sound or microphone. Ethernet works
+  through NAT.
+- Only the 256x144 panel is shown. Profiles other than Minimal are untested,
+  and their HDMI output has no screen.
+- The vendor 6.1 kernel has no virtio drivers, so the mainline kernel is used.
+- Flipper publishes development builds several times a day and the image
+  layout can change. Pin `build` in the config if a new one breaks.
 
 ## License
 
-GPL-3.0-or-later, see [LICENSE](LICENSE). Anyone may use, change and share
-this, but changed versions must stay under the same license and keep the
-copyright notices.
+GPL-3.0-or-later, see [LICENSE](LICENSE).
