@@ -30,7 +30,7 @@ import urllib.request
 import zlib
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 IMAGE_BASE = "https://dl-linux-images.flipp.dev/full-img/"
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "flipper-one-emu"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "flipper-one-emu/config.toml"
@@ -66,11 +66,19 @@ DEFAULTS = {
     "listen": "127.0.0.1",
     "open": "browser",
     "boot_timeout": 300,
+    "audio": True,
+    "mic": False,
 }
 
 
 class Fail(Exception):
     pass
+
+
+def notify(msg):
+    """Desktop notification when started from a launcher, where nobody sees the terminal."""
+    if not sys.stdout.isatty() and shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Flipper One Emulator", "Flipper One Emulator", msg], check=False)
 
 
 def say(msg):
@@ -317,22 +325,27 @@ def pick_entry(meta, profile, kernel):
     return bootable[0]
 
 
+def read_from_image(meta, profile, paths, tmp):
+    """Copy single files out of one profile of the image into tmp, without mounting it."""
+    need("btrfs")
+    prefixes = {"/".join(p.split("/")[:i]) for p in paths for i in range(1, len(p.split("/")) + 1)}
+    regex = "^(" + "|".join(sorted(re.escape(p) for p in prefixes | {"/"})) + ")$"
+    run(["btrfs", "restore", "-r", meta["subvols"]["@" + profile], "--path-regex", regex,
+         Path(meta["dir"]) / "root.btrfs", tmp])
+    found = [Path(tmp + p) for p in paths]
+    if not all(f.exists() for f in found):
+        raise Fail(f"{', '.join(paths)} could not be read from the image")
+    return found
+
+
 def boot_files(meta, entry):
     """Kernel and initramfs for one boot entry, extracted on first use."""
     out = Path(meta["dir"]) / "boot" / entry["profile"] / entry["version"]
     if (out / "Image").exists() and (out / "initrd").exists():
         return out
-    need("btrfs")
     say(f"Extracting kernel {entry['version']} for profile {entry['profile']}")
-    paths = [entry["linux"], entry["initrd"]]
-    prefixes = {"/".join(p.split("/")[:i]) for p in paths for i in range(1, len(p.split("/")) + 1)}
-    regex = "^(" + "|".join(sorted(re.escape(p) for p in prefixes | {"/"})) + ")$"
     with tempfile.TemporaryDirectory(dir=meta["dir"]) as tmp:
-        run(["btrfs", "restore", "-r", meta["subvols"]["@" + entry["profile"]], "--path-regex", regex,
-             Path(meta["dir"]) / "root.btrfs", tmp])
-        kernel, initrd = (Path(tmp + p) for p in paths)
-        if not kernel.exists() or not initrd.exists():
-            raise Fail("the kernel files could not be read from the image")
+        kernel, initrd = read_from_image(meta, entry["profile"], [entry["linux"], entry["initrd"]], tmp)
         out.mkdir(parents=True, exist_ok=True)
         data = kernel.read_bytes()
         # QEMU's EFI loader wants the bare Image; the OS ships it gzipped.
@@ -402,7 +415,8 @@ class Instance:
         port_flag = "-P" if tool == "scp" else "-p"
         return [tool, "-i", str(SSH_KEY), port_flag, str(self.state["ssh_port"]),
                 "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR", "-o", "IdentitiesOnly=yes"], f"{'root' if root else 'user'}@127.0.0.1"
+                "-o", "LogLevel=ERROR", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=10"], \
+            f"{'root' if root else 'user'}@127.0.0.1"
 
     def ssh(self, command, root=False, timeout=30, check=True):
         base, target = self.ssh_base(root=root)
@@ -476,7 +490,10 @@ def qemu_command(inst, meta, entry, boot, opts):
     if kvm:
         machine = ["-M", "virt,acpi=off,gic-version=host", "-accel", "kvm", "-cpu", "host"]
     else:
-        machine = ["-M", "virt,acpi=off", "-accel", "tcg,thread=multi", "-cpu", "max,pauth-impdef=on"]
+        # Emulating pointer authentication is the single most expensive CPU feature
+        # under TCG: with it off, boot went from 21 s to 17 s and a Python loop in
+        # the guest from 7.7 s to 3.1 s on the machine this was measured on.
+        machine = ["-M", "virt,acpi=off", "-accel", "tcg,thread=multi", "-cpu", "max,pauth=off"]
     # The Flipper kernel is device-tree only: with ACPI tables present it finds no
     # timer and panics, hence acpi=off. hvc0 is listed last so systemd logs there.
     append = (f"root=UUID={meta['fsid']} rootflags=subvol=@{entry['profile']} rw rootwait "
@@ -521,7 +538,7 @@ def wait_ready(inst, proc, timeout):
         if elapsed - shown >= 1:
             shown = elapsed
             print(f"\r    waiting for Flipper OS ... {int(elapsed)}s", end="", flush=True)
-        time.sleep(1)
+        time.sleep(0.5)
     print()
     raise Fail(f"Flipper OS did not answer within {timeout}s. It is still running; see `f1emu log` "
                f"and `f1emu screenshot --vt boot.png`, or stop it with `f1emu stop --force`.")
@@ -540,6 +557,66 @@ def open_view(inst, how):
         warn("no Chromium-based browser found for --open app; using the default browser")
     if shutil.which("xdg-open"):
         subprocess.Popen(["xdg-open", url], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+AUDIO_CONF = """\
+context.spa-libs = {{
+    audio.convert.* = audioconvert/libspa-audioconvert
+    support.*       = support/libspa-support
+}}
+context.modules = [
+    {{ name = libpipewire-module-protocol-native }}
+    {{ name = libpipewire-module-client-node }}
+    {{ name = libpipewire-module-adapter }}
+{tunnels}]
+"""
+AUDIO_TUNNEL = """\
+    {{ name = libpipewire-module-pulse-tunnel
+      args = {{ tunnel.mode = {mode} pulse.server.address = "tcp:10.0.2.2:{port}"
+               stream.props = {{ node.name = "pc-{mode}" node.description = "{label}" }} }} }}
+"""
+
+
+def audio_off(inst):
+    port = inst.state.get("audio_port")
+    if port and shutil.which("pactl"):
+        # Unload by what the module is, not by a remembered id: ids are reused
+        # once the host's sound server restarts.
+        for line in run(["pactl", "list", "modules", "short"], check=False).stdout.splitlines():
+            if "module-native-protocol-tcp" in line and f"port={port} " in line + " ":
+                run(["pactl", "unload-module", line.split()[0]], check=False)
+    if port:
+        inst.save(audio_port=None)
+
+
+def audio_on(inst, mic):
+    """Give the guest a sound card by tunnelling its PipeWire to the host's sound server.
+
+    The kernel has no driver for any sound device QEMU can emulate, so the guest
+    gets a network sink (and optionally a source) instead. 10.0.2.2 is the host
+    as seen through QEMU's NAT; on the host side the port is loopback-only.
+    """
+    if not shutil.which("pactl"):
+        raise Fail("pactl not found; sound needs PipeWire or PulseAudio on this PC")
+    audio_off(inst)
+    port = free_port("127.0.0.1", 4714)
+    run(["pactl", "load-module", "module-native-protocol-tcp", "listen=127.0.0.1", f"port={port}",
+         "auth-ip-acl=127.0.0.1"])
+    inst.save(audio_port=port)
+    tunnels = AUDIO_TUNNEL.format(mode="sink", port=port, label="PC speakers")
+    if mic:
+        tunnels += AUDIO_TUNNEL.format(mode="source", port=port, label="PC microphone")
+    inst.ssh("systemctl --user stop f1emu-audio 2>/dev/null; systemctl --user reset-failed f1emu-audio 2>/dev/null; "
+             f"cat > $XDG_RUNTIME_DIR/f1emu-audio.conf <<'EOF'\n{AUDIO_CONF.format(tunnels=tunnels)}EOF\n"
+             "systemd-run --user --quiet --unit f1emu-audio pipewire -c $XDG_RUNTIME_DIR/f1emu-audio.conf")
+
+
+def unmount_all(inst):
+    for target in inst.state.get("mounts", []):
+        tool = shutil.which("fusermount3") or shutil.which("fusermount")
+        if tool and os.path.ismount(target):
+            run([tool, "-u", "-z", target], check=False)
+    inst.save(mounts=[])
 
 
 def parse_size(text):
@@ -621,6 +698,13 @@ def cmd_start(a):
     if grown:
         inst.ssh("btrfs filesystem resize max /", root=True, check=False)
     say(f"Flipper OS is up after {took:.0f}s")
+    notify(f"Flipper OS is up after {took:.0f}s")
+    mic = a.mic or conf["mic"]
+    if (conf["audio"] or mic) and not a.no_audio and opts["network"]:
+        try:
+            audio_on(inst, mic)
+        except (Fail, subprocess.TimeoutExpired) as e:
+            warn(f"no sound: {e}")
     print(f"    Remote view : {inst.url()}\n    App manager : {inst.url('apps')}\n"
           f"    Shell       : f1emu ssh{'' if inst.name == 'default' else ' -n ' + inst.name}")
     if opts["port"] != (a.port or conf["port"]):
@@ -632,6 +716,9 @@ def cmd_stop(a):
     targets = all_instances() if a.all else [Instance(a.name)]
     for inst in targets:
         pid = inst.pid()
+        if inst.state:
+            unmount_all(inst)
+            audio_off(inst)
         if not pid:
             if not a.all:
                 say(f"Instance '{inst.name}' is not running")
@@ -717,13 +804,16 @@ def read_panel(inst, wait=3.0):
     canvas = bytearray(PANEL_W * PANEL_H)
     covered = False
     deadline = time.monotonic() + wait
-    with urllib.request.urlopen(inst.url("stream"), timeout=wait + 5) as res:
-        while not covered and time.monotonic() < deadline:
-            x, y, w, h = struct.unpack("<4H", res.read(8))
-            data = res.read(w * h)
-            for row in range(h):
-                canvas[(y + row) * PANEL_W + x:(y + row) * PANEL_W + x + w] = data[row * w:(row + 1) * w]
-            covered = w == PANEL_W and h == PANEL_H
+    try:
+        with urllib.request.urlopen(inst.url("stream"), timeout=wait + 5) as res:
+            while not covered and time.monotonic() < deadline:
+                x, y, w, h = struct.unpack("<4H", res.read(8))
+                data = res.read(w * h)
+                for row in range(h):
+                    canvas[(y + row) * PANEL_W + x:(y + row) * PANEL_W + x + w] = data[row * w:(row + 1) * w]
+                covered = w == PANEL_W and h == PANEL_H
+    except (OSError, struct.error) as e:
+        raise Fail(f"the device's remote view does not answer ({e})") from e
     if not covered:
         raise Fail("the device sent no full frame")
     return canvas
@@ -767,6 +857,13 @@ def cmd_apps(a):
             if not app["installed"]:
                 print(f"available  {app['name']:28} {app['size']:>8}  {app['folder']}")
         return
+    if a.action == "add":
+        if not os.path.isfile(a.app):
+            raise Fail(f"{a.app} is not a file")
+        base, target = inst.ssh_base("scp")
+        run(base + [a.app, f"{target}:Apps/"], capture_output=False)
+        say(f"{os.path.basename(a.app)} copied to the device's Apps folder")
+        return
     pool = apps["offered"] if a.action == "install" else apps["installed"]
     matches = [x for x in pool if x["name"].lower() == a.app.lower()] or [x for x in pool if a.app.lower() in x["name"].lower()]
     if len(matches) != 1:
@@ -777,6 +874,40 @@ def cmd_apps(a):
     if not answer.get("ok"):
         raise Fail(f"{app['name']}: {answer.get('said', 'the device refused')}")
     say(f"{app['name']}: {answer.get('said', 'done')}")
+
+
+def cmd_audio(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    if a.state == "off":
+        audio_off(inst)
+        inst.ssh("systemctl --user stop f1emu-audio", check=False)
+        say("Sound disconnected")
+    else:
+        audio_on(inst, a.mic)
+        say("Sound connected to this PC" + (", microphone included" if a.mic else ""))
+
+
+def cmd_mount(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    if not shutil.which("sshfs"):
+        raise Fail("sshfs is not installed (package sshfs); it is what makes the shared folder work")
+    target = os.path.abspath(a.dir)
+    os.makedirs(target, exist_ok=True)
+    if os.path.ismount(target):
+        raise Fail(f"{target} is already a mount point")
+    options = (f"port={inst.state['ssh_port']},IdentityFile={SSH_KEY},IdentitiesOnly=yes,StrictHostKeyChecking=no,"
+               "UserKnownHostsFile=/dev/null,LogLevel=ERROR,reconnect,ServerAliveInterval=15")
+    inst.ssh(f"mkdir -p {a.guest_dir}")
+    run(["sshfs", "-o", options, f"user@127.0.0.1:{a.guest_dir}", target])
+    inst.save(mounts=sorted(set(inst.state.get("mounts", [])) | {target}))
+    say(f"{target} now shows the device's {a.guest_dir}; it is released by `f1emu umount` or `f1emu stop`")
+
+
+def cmd_umount(a):
+    unmount_all(Instance(a.name))
+    say("Shared folders released")
 
 
 def cmd_log(a):
@@ -881,10 +1012,18 @@ def cmd_desktop(a):
         say("Launcher removed")
         return
     entry.parent.mkdir(parents=True, exist_ok=True)
+    icon = DATA / "icon.png"
+    if not icon.exists() and (builds := local_builds()):
+        with tempfile.TemporaryDirectory(dir=builds[-1]["dir"]) as tmp:
+            picture, = read_from_image(builds[-1], "Minimal", ["/usr/share/flipctl/assets/remote/device.png"], tmp)
+            shutil.copy(picture, icon)
+    me = Path(__file__).resolve()
     entry.write_text("[Desktop Entry]\nType=Application\nName=Flipper One Emulator\n"
                      "Comment=Boot the real Flipper One OS in QEMU\n"
-                     f"Exec={Path(__file__).resolve()} start --open app\nTerminal=true\n"
-                     "Icon=computer\nCategories=Development;Emulator;\n")
+                     f"Exec={me} start --open app\nTerminal=false\n"
+                     f"Icon={icon if icon.exists() else 'computer'}\nCategories=Development;Emulator;\n"
+                     "Actions=stop;\n\n[Desktop Action stop]\nName=Shut down\n"
+                     f"Exec={me} stop --all\n")
     say(f"Launcher written to {entry}")
 
 
@@ -922,6 +1061,8 @@ def main():
     s.add_argument("--listen", help="address the remote view binds to; 0.0.0.0 shares it on your network")
     s.add_argument("--forward", action="append", default=[], metavar="HOST:GUEST[/udp]", help="forward one more port (repeatable)")
     s.add_argument("--no-network", action="store_true", help="cut the guest off from the internet")
+    s.add_argument("--no-audio", action="store_true", help="do not connect the guest's sound to this PC")
+    s.add_argument("--mic", action="store_true", help="also give the guest this PC's microphone")
     s.add_argument("--disk-size", metavar="SIZE", help="grow the disk when creating the instance, e.g. 16G")
     s.add_argument("--ephemeral", action="store_true", help="throw away all changes when the emulator stops")
     s.add_argument("--open", choices=("browser", "app", "none"), help="how to show the device once it is up")
@@ -961,9 +1102,19 @@ def main():
     s.add_argument("--grey", action="store_true", help="raw greyscale instead of the amber backlight")
     s.add_argument("--vt", action="store_true", help="capture the boot console instead of the panel")
 
-    s = add("apps", cmd_apps, "list, install, run or remove Flipper apps")
-    s.add_argument("action", choices=("list", "install", "run", "remove"))
-    s.add_argument("app", nargs="?", help="app name or a unique part of it")
+    s = add("apps", cmd_apps, "list, install, run or remove Flipper apps; `add` copies in your own app file")
+    s.add_argument("action", choices=("list", "install", "run", "remove", "add"))
+    s.add_argument("app", nargs="?", help="app name or a unique part of it; for `add`, a .AppImage or .fap.py file")
+
+    s = add("audio", cmd_audio, "connect or disconnect the guest's sound while it runs")
+    s.add_argument("state", choices=("on", "off"))
+    s.add_argument("--mic", action="store_true", help="also give the guest this PC's microphone")
+
+    s = add("mount", cmd_mount, "show a folder of the device as a folder on this PC (needs sshfs)")
+    s.add_argument("dir", help="empty folder on this PC")
+    s.add_argument("guest_dir", nargs="?", default="Files", help="folder on the device (default: Files)")
+
+    add("umount", cmd_umount, "release the shared folders of an instance")
 
     s = add("log", cmd_log, "show the boot console log")
     s.add_argument("-f", "--follow", action="store_true")
@@ -1004,13 +1155,14 @@ def main():
 
     a = p.parse_args()
     if a.cmd == "apps" and a.action != "list" and not a.app:
-        p.error("apps install/run/remove need an app name")
+        p.error("apps install/run/remove/add need an app name or file")
     if a.cmd == "snapshot" and a.action != "list" and not a.tag:
         p.error("snapshot save/load/delete need a tag")
     try:
         a.fn(a)
     except Fail as e:
         print(f"error: {e}", file=sys.stderr)
+        notify(f"Error: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
