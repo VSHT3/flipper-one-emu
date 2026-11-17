@@ -1,0 +1,42 @@
+#!/bin/sh
+# f1emu: a pretend 5G modem. flipctl learns about modems by running mmcli and
+# qmicli, so answering here fills its screens. Nothing below this is real.
+M=/org/freedesktop/ModemManager1
+S=/run/f1emu/modem
+sig=$(cat $S/signal 2>/dev/null || echo 74)
+op=$(cat $S/operator 2>/dev/null || echo "Test Network")
+tech=$(cat $S/tech 2>/dev/null || echo 5gnr)
+args=" $* "
+case "$args" in
+  *" -L "*)
+    printf 'modem-list.length   : 1\nmodem-list.value[1] : %s/Modem/0\n' $M;;
+  *" -b "*)
+    cat <<J
+{"bearer":{"dbus-path":"$M/Bearer/0","type":"default","status":{"connected":"yes","suspended":"no","interface":"wwan0","ip-timeout":"20"},"properties":{"apn":"internet","ip-type":"ipv4"},"ipv4-config":{"method":"static","address":"10.64.12.7","prefix":"30","gateway":"10.64.12.8","dns":["10.64.12.8"],"mtu":"1500"},"ipv6-config":{"method":"--"}}}
+J
+    ;;
+  *" -m "*" -J "*|*" -m "*" --output-json "*)
+    cat <<J
+{"modem":{"dbus-path":"$M/Modem/0","generic":{"manufacturer":"Quectel","model":"RM520N-GL (simulated)","revision":"RM520NGLAAR01A08M4G","state":"connected","power-state":"on","access-technologies":["$tech"],"signal-quality":{"value":"$sig","recent":"yes"},"bearers":["$M/Bearer/0"],"primary-port":"cdc-wdm0","ports":["cdc-wdm0 (qmi)","wwan0 (net)"],"sim":"$M/SIM/0","equipment-identifier":"860000000000000"},"3gpp":{"imei":"860000000000000","operator-code":"00101","operator-name":"$op","registration-state":"home","packet-service-state":"attached"}}}
+J
+    ;;
+  *" -m "*)
+    cat <<K
+modem.dbus-path                                 : $M/Modem/0
+modem.generic.manufacturer                      : Quectel
+modem.generic.model                             : RM520N-GL (simulated)
+modem.generic.state                             : connected
+modem.generic.power-state                       : on
+modem.generic.access-technologies.length        : 1
+modem.generic.access-technologies.value[1]      : $tech
+modem.generic.signal-quality.value              : $sig
+modem.generic.signal-quality.recent             : yes
+modem.generic.bearers.length                    : 1
+modem.generic.bearers.value[1]                  : $M/Bearer/0
+modem.3gpp.operator-code                        : 00101
+modem.3gpp.operator-name                        : $op
+modem.3gpp.registration-state                   : home
+K
+    ;;
+  *) exec /usr/bin/mmcli "$@";;
+esac

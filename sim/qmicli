@@ -1,0 +1,60 @@
+#!/bin/sh
+# f1emu: radio details for the pretend modem, in qmicli's own wording.
+S=/run/f1emu/modem
+sig=$(cat $S/signal 2>/dev/null || echo 74)
+rsrp=$(( -140 + sig * 96 / 100 ))
+case " $* " in
+  *" --nas-get-serving-system "*) cat <<T
+[/dev/cdc-wdm0] Successfully got serving system:
+	Registration state: 'registered'
+	CS: 'attached'
+	PS: 'attached'
+	Selected network: '3gpp'
+	Radio interfaces: '1'
+		[0]: 'lte'
+	Roaming status: 'off'
+	Current PLMN:
+		MCC: '001'
+		MNC: '01'
+		Description: 'Test Network'
+	3GPP location area code: '65534'
+	3GPP cell ID: '26385411'
+	LTE tracking area code: '12345'
+T
+  ;;
+  *" --nas-get-cell-location-info "*) cat <<T
+[/dev/cdc-wdm0] Successfully got cell location info
+Intrafrequency LTE Info
+	UE In Idle: 'no'
+	PLMN: '00101'
+	Tracking Area Code: '12345'
+	Global Cell ID: '26385411'
+	EUTRA Absolute RF Channel Number: '1300' (E-UTRA band 3: 1800+)
+	Serving Cell ID: '271'
+	Cell [0]:
+		Physical Cell ID: '271'
+		RSRQ: '-11.0' dB
+		RSRP: '$rsrp.0' dBm
+		RSSI: '$((rsrp + 28)).0' dBm
+T
+  ;;
+  *" --nas-get-signal-strength "*) cat <<T
+[/dev/cdc-wdm0] Successfully got signal strength
+Current:
+	Network 'lte': '$((rsrp + 28)) dBm'
+RSSI:
+	Network 'lte': '$((rsrp + 28)) dBm'
+ECIO:
+	Network 'lte': '-2.5 dB'
+IO: '-106 dBm'
+SINR (8): '9.0 dB'
+RSRQ:
+	Network 'lte': '-11 dB'
+SNR:
+	Network 'lte': '11.4 dB'
+RSRP:
+	Network 'lte': '$rsrp dBm'
+T
+  ;;
+  *) [ -x /usr/bin/qmicli ] && exec /usr/bin/qmicli "$@"; exit 1;;
+esac

@@ -1,0 +1,30 @@
+{
+ "usb-c": {
+  "width": 2213.4,
+  "height": 305.3,
+  "tip_x": 152.6,
+  "tip_y": 152.6,
+  "degrees": 0.0
+ },
+ "hdmi": {
+  "width": 305.3,
+  "height": 2213.4,
+  "tip_x": 152.6,
+  "tip_y": 2060.7,
+  "degrees": -90.0
+ },
+ "eth-grey": {
+  "width": 1845.0,
+  "height": 1432.2,
+  "tip_x": 1692.4,
+  "tip_y": 1279.6,
+  "degrees": 216.2
+ },
+ "eth-orange": {
+  "width": 1845.0,
+  "height": 1432.2,
+  "tip_x": 1692.4,
+  "tip_y": 1279.6,
+  "degrees": 216.2
+ }
+}
