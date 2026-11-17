@@ -1,0 +1,1020 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 VSHT3
+"""f1emu - run the real Flipper One OS on a Linux PC.
+
+Downloads an official Flipper OS image, pulls the kernel out of it without
+root, boots it in QEMU and opens the device's own remote view in a browser.
+Standard library only; needs qemu-system-aarch64, qemu-img, zstd, btrfs-progs
+and ssh on the host.
+"""
+import argparse
+import base64
+import gzip
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+import zlib
+from pathlib import Path
+
+VERSION = "0.1.0"
+IMAGE_BASE = "https://dl-linux-images.flipp.dev/full-img/"
+DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "flipper-one-emu"
+CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "flipper-one-emu/config.toml"
+BUILDS = DATA / "builds"
+INSTANCES = DATA / "instances"
+SSH_KEY = DATA / "ssh/id_ed25519"
+KEYS = ("up", "down", "left", "right", "ok", "back", "appsw", "esc", "view", "power", "edit", "run", "ptt")
+PANEL_W, PANEL_H = 256, 144
+AMBER = (0xFF, 0x82, 0x00)
+# (path, how to hand it to QEMU). Distros ship the same EDK2 build under different names.
+FIRMWARE = (
+    ("/usr/share/edk2/aarch64/QEMU_EFI.fd", "bios"),
+    ("/usr/share/qemu-efi-aarch64/QEMU_EFI.fd", "bios"),
+    ("/usr/share/edk2/aarch64/QEMU_EFI-pflash.raw", "pflash"),
+    ("/usr/share/AAVMF/AAVMF_CODE.fd", "pflash"),
+    ("/usr/share/qemu/edk2-aarch64-code.fd", "pflash"),
+)
+TOOLS = {
+    "qemu-system-aarch64": "qemu-system-aarch64 (Debian: qemu-system-arm, Fedora: qemu-system-aarch64)",
+    "qemu-img": "qemu-img (Debian: qemu-utils)",
+    "zstd": "zstd",
+    "btrfs": "btrfs-progs",
+    "ssh": "openssh",
+    "ssh-keygen": "openssh",
+}
+DEFAULTS = {
+    "variant": "flipper-one",
+    "profile": "Minimal",
+    "memory": 4096,
+    "cpus": min(8, os.cpu_count() or 1),
+    "port": 8899,
+    "ssh_port": 2222,
+    "listen": "127.0.0.1",
+    "open": "browser",
+    "boot_timeout": 300,
+}
+
+
+class Fail(Exception):
+    pass
+
+
+def say(msg):
+    print(f"==> {msg}", flush=True)
+
+
+def warn(msg):
+    print(f"!!  {msg}", file=sys.stderr, flush=True)
+
+
+def run(cmd, **kw):
+    kw.setdefault("check", True)
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    try:
+        return subprocess.run([str(c) for c in cmd], **kw)
+    except subprocess.CalledProcessError as e:
+        raise Fail(f"{cmd[0]} failed: {(e.stderr or e.stdout or '').strip()[-600:]}") from e
+
+
+def need(*tools):
+    missing = [t for t in tools if not shutil.which(t)]
+    if missing:
+        raise Fail("missing on this system: " + "; ".join(f"{t} (package {TOOLS[t]})" for t in missing))
+
+
+def settings():
+    conf = dict(DEFAULTS)
+    if CONFIG.exists():
+        loaded = tomllib.loads(CONFIG.read_text())
+        unknown = set(loaded) - set(DEFAULTS) - {"build"}
+        if unknown:
+            raise Fail(f"{CONFIG}: unknown keys {sorted(unknown)}")
+        conf.update(loaded)
+    return conf
+
+
+def http(url, data=None, timeout=10):
+    req = urllib.request.Request(url, headers={"User-Agent": f"f1emu/{VERSION}"})
+    if data is not None:
+        req.data = json.dumps(data).encode()
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        return res.read()
+
+
+# ---------- images ----------
+
+def remote_builds(include_branches=False):
+    listing = json.loads(http(IMAGE_BASE + "manifest.json", timeout=30))
+    out = []
+    for d in listing["directories"]:
+        name = d["name"].rstrip("/")
+        if include_branches or name.isdigit():
+            out.append((int(re.match(r"\d+", name).group()), name, d["mtime"]))
+    return sorted(out)
+
+
+def build_manifest(name):
+    try:
+        return json.loads(http(f"{IMAGE_BASE}{name}/manifest.json", timeout=30))
+    except urllib.error.HTTPError as e:
+        raise Fail(f"build {name} is not on the server (HTTP {e.code}); see `f1emu builds --remote`") from e
+
+
+def local_builds():
+    found = []
+    for meta in sorted(BUILDS.glob("*/meta.json")):
+        found.append(json.loads(meta.read_text()) | {"dir": str(meta.parent)})
+    return sorted(found, key=lambda m: (m["number"], m["variant"]))
+
+
+def download(url, dest, size, sha256):
+    part = dest.with_name(dest.name + ".part")
+    have = part.stat().st_size if part.exists() else 0
+    if have > size:
+        part.unlink()
+        have = 0
+    digest = hashlib.sha256()
+    if have:
+        with open(part, "rb") as f:
+            while chunk := f.read(1 << 20):
+                digest.update(chunk)
+    if have < size:
+        req = urllib.request.Request(url, headers={"Range": f"bytes={have}-", "User-Agent": f"f1emu/{VERSION}"})
+        started = time.monotonic()
+        with urllib.request.urlopen(req, timeout=60) as res, open(part, "ab") as f:
+            if have and res.status != 206:
+                raise Fail("the server ignored the resume request; delete the .part file and retry")
+            shown = 0
+            while chunk := res.read(1 << 20):
+                f.write(chunk)
+                digest.update(chunk)
+                have += len(chunk)
+                if time.monotonic() - shown > 0.5:
+                    shown = time.monotonic()
+                    rate = have / max(shown - started, 0.1) / 1e6
+                    print(f"\r    {have / 1e6:7.0f} / {size / 1e6:.0f} MB  ({rate:.0f} MB/s)", end="", flush=True)
+        print()
+    if digest.hexdigest() != sha256:
+        part.unlink()
+        raise Fail("download is corrupt (SHA-256 mismatch); it was deleted, run the command again")
+    part.rename(dest)
+
+
+def root_partition(head):
+    """Find the root partition in a GPT read from the start of the image."""
+    if head[512:520] != b"EFI PART":
+        raise Fail("the image has no GPT partition table")
+    entries_lba, = struct.unpack_from("<Q", head, 512 + 72)
+    count, entry_size = struct.unpack_from("<II", head, 512 + 80)
+    best = None
+    for i in range(count):
+        entry = head[entries_lba * 512 + i * entry_size:][:entry_size]
+        first, last = struct.unpack_from("<QQ", entry, 32)
+        if not any(entry[:16]):
+            continue
+        name = entry[56:128].decode("utf-16le").rstrip("\0")
+        candidate = (name == "root", last - first, first * 512, (last - first + 1) * 512)
+        best = max(best, candidate) if best else candidate
+    if not best:
+        raise Fail("the image has no partitions")
+    return best[2], best[3]
+
+
+def unpack_root(zst, dest):
+    """Decompress the image and keep only its root partition, sparse, in one pass."""
+    need("zstd")
+    proc = subprocess.Popen(["zstd", "-dc", "-T0", str(zst)], stdout=subprocess.PIPE)
+    try:
+        head = proc.stdout.read(1 << 20)
+        offset, size = root_partition(head)
+        skip = offset - len(head)
+        if skip < 0:
+            raise Fail("unexpected partition layout in the image")
+        while skip:
+            skip -= len(proc.stdout.read(min(skip, 1 << 20)) or b"") or (_ for _ in ()).throw(Fail("image is truncated"))
+        zeros = bytes(1 << 20)
+        left = size
+        with open(dest, "wb") as out:
+            while left:
+                chunk = proc.stdout.read(min(left, 1 << 20))
+                if not chunk:
+                    raise Fail("image is truncated")
+                left -= len(chunk)
+                if chunk == zeros[:len(chunk)]:
+                    out.seek(len(chunk), os.SEEK_CUR)
+                else:
+                    out.write(chunk)
+            out.truncate(size)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def inspect_root(root, build_dir):
+    """Read the profile list and boot entries straight from the btrfs image."""
+    need("btrfs")
+    fsid = re.search(r"^fsid\s+(\S+)", run(["btrfs", "inspect-internal", "dump-super", root]).stdout, re.M).group(1)
+    tree = run(["btrfs", "inspect-internal", "dump-tree", "-t", "root", root]).stdout
+    subvols = {name: int(sid) for sid, name in re.findall(r"\(FS_TREE ROOT_REF (\d+)\).*\n.*\bname (\S+)", tree)}
+    if "boot" not in subvols:
+        raise Fail("this image has no boot subvolume; its layout is not supported")
+    entries = []
+    with tempfile.TemporaryDirectory(dir=build_dir) as tmp:
+        run(["btrfs", "restore", "-r", subvols["boot"], root, tmp])
+        for conf in sorted(Path(tmp).glob("loader/entries/*.conf")):
+            fields = dict(line.split(None, 1) for line in conf.read_text().splitlines() if line and not line.startswith("#"))
+            m = re.match(r"/(@[^/]+)(/.+)", fields.get("linux", ""))
+            if not m or m.group(1) not in subvols:
+                continue
+            version = fields["version"]
+            config = Path(tmp) / f"config-{version}"
+            entries.append({
+                "profile": m.group(1)[1:],
+                "version": version,
+                "linux": m.group(2),
+                "initrd": re.sub(r"^/@[^/]+", "", fields["initrd"]),
+                # Without virtio-blk the kernel cannot see QEMU's disk at all.
+                "bootable": config.exists() and bool(re.search(r"^CONFIG_VIRTIO_BLK=[ym]", config.read_text(), re.M)),
+            })
+    return {"fsid": fsid, "subvols": subvols, "entries": entries}
+
+
+def fetch(number=None, variant=None, keep=False):
+    conf = settings()
+    variant = variant or conf["variant"]
+    if number is None:
+        number = conf.get("build")
+    if number is None:
+        say("Looking up the newest official build")
+        number = remote_builds()[-1][1]
+    number = str(number)
+    build_dir = BUILDS / f"{number}-{variant}"
+    if (build_dir / "meta.json").exists():
+        return json.loads((build_dir / "meta.json").read_text()) | {"dir": str(build_dir)}
+    need("zstd", "btrfs")
+    manifest = build_manifest(number)
+    files = {f["path"]: f for f in manifest["files"]}
+    name = next((p for p in files if re.fullmatch(rf".*-{re.escape(variant)}-\d+\.img\.zst", p)), None)
+    if not name:
+        variants = sorted({m.group(1) for p in files if (m := re.fullmatch(r"debian-\d+-(.+)-\d+\.img\.zst", p))})
+        raise Fail(f"build {number} has no '{variant}' image; available: {', '.join(variants)}")
+    free = shutil.disk_usage(DATA if DATA.exists() else DATA.parent).free
+    if free < 10e9:
+        raise Fail(f"only {free / 1e9:.1f} GB free; about 10 GB are needed while setting up")
+    build_dir.mkdir(parents=True, exist_ok=True)
+    zst = build_dir / name
+    if not zst.exists():
+        say(f"Downloading Flipper OS build {number} ({variant}, {files[name]['size'] / 1e9:.1f} GB)")
+        download(f"{IMAGE_BASE}{number}/{name}", zst, files[name]["size"], files[name]["sha256"])
+    say("Unpacking the root filesystem")
+    root = build_dir / "root.btrfs"
+    unpack_root(zst, root)
+    say("Reading profiles and kernels from the image")
+    meta = inspect_root(root, build_dir) | {
+        "number": int(re.match(r"\d+", number).group()),
+        "name": number,
+        "variant": variant,
+        "sha256": files[name]["sha256"],
+        "built": manifest["build"]["timestamp"],
+    }
+    if not any(e["bootable"] for e in meta["entries"]):
+        shutil.rmtree(build_dir)
+        raise Fail(f"build {number} has no kernel that can boot in QEMU")
+    (build_dir / "meta.json").write_text(json.dumps(meta, indent=1))
+    if not keep:
+        zst.unlink()
+    return meta | {"dir": str(build_dir)}
+
+
+def pick_entry(meta, profile, kernel):
+    names = sorted({e["profile"] for e in meta["entries"]})
+    wanted = [e for e in meta["entries"] if e["profile"].lower() == profile.lower()]
+    if not wanted:
+        raise Fail(f"build {meta['name']} has no profile '{profile}'; it has: {', '.join(names)}")
+    if kernel:
+        wanted = [e for e in wanted if kernel in e["version"]]
+        if not wanted:
+            raise Fail(f"profile {profile} has no kernel matching '{kernel}'")
+    bootable = [e for e in wanted if e["bootable"]]
+    if not bootable:
+        raise Fail(f"kernel {wanted[0]['version']} has no virtio drivers, so it cannot boot in QEMU")
+    return bootable[0]
+
+
+def boot_files(meta, entry):
+    """Kernel and initramfs for one boot entry, extracted on first use."""
+    out = Path(meta["dir"]) / "boot" / entry["profile"] / entry["version"]
+    if (out / "Image").exists() and (out / "initrd").exists():
+        return out
+    need("btrfs")
+    say(f"Extracting kernel {entry['version']} for profile {entry['profile']}")
+    paths = [entry["linux"], entry["initrd"]]
+    prefixes = {"/".join(p.split("/")[:i]) for p in paths for i in range(1, len(p.split("/")) + 1)}
+    regex = "^(" + "|".join(sorted(re.escape(p) for p in prefixes | {"/"})) + ")$"
+    with tempfile.TemporaryDirectory(dir=meta["dir"]) as tmp:
+        run(["btrfs", "restore", "-r", meta["subvols"]["@" + entry["profile"]], "--path-regex", regex,
+             Path(meta["dir"]) / "root.btrfs", tmp])
+        kernel, initrd = (Path(tmp + p) for p in paths)
+        if not kernel.exists() or not initrd.exists():
+            raise Fail("the kernel files could not be read from the image")
+        out.mkdir(parents=True, exist_ok=True)
+        data = kernel.read_bytes()
+        # QEMU's EFI loader wants the bare Image; the OS ships it gzipped.
+        (out / "Image").write_bytes(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
+        shutil.copy(initrd, out / "initrd")
+    return out
+
+
+# ---------- instances ----------
+
+class Instance:
+    def __init__(self, name):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise Fail("instance names may only contain letters, digits, '_', '.' and '-'")
+        self.name = name
+        self.dir = INSTANCES / name
+        self.disk = self.dir / "disk.qcow2"
+        self.state_file = self.dir / "instance.json"
+        self.pid_file = self.dir / "qemu.pid"
+        self.qmp_sock = self.dir / "qmp.sock"
+        self.console = self.dir / "console.log"
+        self.qemu_log = self.dir / "qemu.log"
+
+    @property
+    def state(self):
+        return json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
+
+    def save(self, **changes):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text(json.dumps(self.state | changes, indent=1))
+
+    def pid(self):
+        try:
+            pid = int(self.pid_file.read_text())
+            if "qemu-system-aarch64" in Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace"):
+                return pid
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def running(self):
+        return self.pid() is not None
+
+    def require_running(self):
+        if not self.running():
+            raise Fail(f"instance '{self.name}' is not running; start it with `f1emu start`")
+
+    def url(self, path=""):
+        host = self.state["listen"]
+        return f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{self.state['port']}/{path}"
+
+    def qmp(self, command, **arguments):
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(10)
+            s.connect(str(self.qmp_sock))
+            f = s.makefile("rw")
+            f.readline()
+            for msg in ({"execute": "qmp_capabilities"}, {"execute": command, "arguments": arguments}):
+                f.write(json.dumps(msg) + "\n")
+                f.flush()
+                while "return" not in (reply := json.loads(f.readline())):
+                    if "error" in reply:
+                        raise Fail(f"QEMU refused {command}: {reply['error']['desc']}")
+            return reply["return"]
+
+    def ssh_base(self, tool="ssh", root=False):
+        port_flag = "-P" if tool == "scp" else "-p"
+        return [tool, "-i", str(SSH_KEY), port_flag, str(self.state["ssh_port"]),
+                "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR", "-o", "IdentitiesOnly=yes"], f"{'root' if root else 'user'}@127.0.0.1"
+
+    def ssh(self, command, root=False, timeout=30, check=True):
+        base, target = self.ssh_base(root=root)
+        return run(base + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", target, command], timeout=timeout, check=check)
+
+
+def all_instances():
+    return [Instance(p.name) for p in sorted(INSTANCES.glob("*")) if (p / "instance.json").exists()]
+
+
+def free_port(host, wanted, taken=()):
+    for port in range(wanted, wanted + 200):
+        if port in taken:
+            continue
+        with socket.socket() as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise Fail(f"no free port near {wanted}")
+
+
+def ssh_public_key():
+    if not SSH_KEY.exists():
+        need("ssh-keygen")
+        SSH_KEY.parent.mkdir(parents=True, exist_ok=True)
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "f1emu", "-f", SSH_KEY])
+    return SSH_KEY.with_suffix(".pub").read_text().strip()
+
+
+def firmware_args():
+    for path, mode in FIRMWARE:
+        if os.path.exists(path):
+            if mode == "bios":
+                return ["-bios", path]
+            return ["-drive", f"if=pflash,format=raw,readonly=on,file={path}"]
+    raise Fail("no AArch64 UEFI firmware found (package edk2-aarch64, qemu-efi-aarch64 or edk2-aarch64 on Fedora)")
+
+
+def credentials(pubkey):
+    """Adapt the guest through systemd credentials, so the image itself stays untouched.
+
+    The SSH key lets `f1emu ssh` in. The drop-in is what makes hosted apps work:
+    QEMU has no Flipper panel, so seat1 never exists, the unit's login session is
+    refused, and without a session there is no runtime directory for the
+    compositor apps are drawn in. Dropping the seat gets a plain session; the
+    rest selects software rendering, as there is no GPU either.
+
+    On the kernel command line because this kernel has neither dmi-sysfs nor
+    fw_cfg, the two channels systemd reads QEMU-supplied credentials from.
+    """
+    tmpfiles = (
+        "d /home/user/.ssh 0700 user user -\n"
+        f"f /home/user/.ssh/authorized_keys 0600 user user - {pubkey}\n"
+    )
+    creds = {
+        "ssh.authorized_keys.root": pubkey.encode(),
+        "tmpfiles.extra": tmpfiles.encode(),
+        "systemd.unit-dropin.flipctl.service": (
+            b"[Service]\nEnvironment=XDG_SEAT=\n"
+            b"Environment=WLR_RENDERER=pixman FLIPCTL_NO_GPU=1 SDL_RENDER_DRIVER=software LIBGL_ALWAYS_SOFTWARE=1\n"),
+    }
+    return " ".join(f"systemd.set_credential_binary={name}:{base64.b64encode(value).decode()}"
+                    for name, value in creds.items())
+
+
+def qemu_command(inst, meta, entry, boot, opts):
+    kvm = platform.machine() == "aarch64" and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    if kvm:
+        machine = ["-M", "virt,acpi=off,gic-version=host", "-accel", "kvm", "-cpu", "host"]
+    else:
+        machine = ["-M", "virt,acpi=off", "-accel", "tcg,thread=multi", "-cpu", "max,pauth-impdef=on"]
+    # The Flipper kernel is device-tree only: with ACPI tables present it finds no
+    # timer and panics, hence acpi=off. hvc0 is listed last so systemd logs there.
+    append = (f"root=UUID={meta['fsid']} rootflags=subvol=@{entry['profile']} rw rootwait "
+              f"console=tty0 console=hvc0 {credentials(ssh_public_key())} {opts['append']}").strip()
+    forwards = [f"hostfwd=tcp:{opts['listen']}:{opts['port']}-:8899", f"hostfwd=tcp:127.0.0.1:{opts['ssh_port']}-:22"]
+    for spec in opts["forward"]:
+        m = re.fullmatch(r"(\d+):(\d+)(/udp)?", spec)
+        if not m:
+            raise Fail(f"--forward wants HOSTPORT:GUESTPORT[/udp], not '{spec}'")
+        forwards.append(f"hostfwd={'udp' if m.group(3) else 'tcp'}:{opts['listen']}:{m.group(1)}-:{m.group(2)}")
+    net = "user,id=net0," + ",".join(forwards) + ("" if opts["network"] else ",restrict=on")
+    cmd = ["qemu-system-aarch64", "-name", f"flipper-one-{inst.name}", *machine,
+           "-smp", str(opts["cpus"]), "-m", str(opts["memory"]),
+           *firmware_args(), "-device", "ramfb",
+           "-kernel", str(boot / "Image"), "-initrd", str(boot / "initrd"), "-append", append,
+           "-drive", f"if=none,file={inst.disk},format=qcow2,id=hd0,discard=unmap",
+           "-device", "virtio-blk-device,drive=hd0",
+           "-netdev", net, "-device", "virtio-net-device,netdev=net0",
+           "-device", "virtio-rng-device",
+           "-device", "virtio-serial-device",
+           "-chardev", f"file,id=con0,path={inst.console}", "-device", "virtconsole,chardev=con0",
+           "-qmp", f"unix:{inst.qmp_sock},server=on,wait=off",
+           "-pidfile", str(inst.pid_file)]
+    if opts["ephemeral"]:
+        cmd.append("-snapshot")
+    cmd += ["-display", opts["display"]] + opts["qemu_arg"]
+    return cmd
+
+
+def wait_ready(inst, proc, timeout):
+    started = time.monotonic()
+    shown = 0
+    while (elapsed := time.monotonic() - started) < timeout:
+        if proc.poll() is not None:
+            raise Fail(f"QEMU exited (code {proc.returncode}):\n{inst.qemu_log.read_text()[-1500:]}")
+        try:
+            http(inst.url("apps.json"), timeout=3)
+            print()
+            return elapsed
+        except (OSError, urllib.error.URLError):
+            pass
+        if elapsed - shown >= 1:
+            shown = elapsed
+            print(f"\r    waiting for Flipper OS ... {int(elapsed)}s", end="", flush=True)
+        time.sleep(1)
+    print()
+    raise Fail(f"Flipper OS did not answer within {timeout}s. It is still running; see `f1emu log` "
+               f"and `f1emu screenshot --vt boot.png`, or stop it with `f1emu stop --force`.")
+
+
+def open_view(inst, how):
+    url = inst.url()
+    if how == "none":
+        return
+    if how == "app":
+        for exe in ("chromium", "brave", "google-chrome-stable", "google-chrome", "vivaldi", "microsoft-edge"):
+            if shutil.which(exe):
+                subprocess.Popen([exe, f"--app={url}", "--window-size=1100,760"], start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+        warn("no Chromium-based browser found for --open app; using the default browser")
+    if shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def parse_size(text):
+    m = re.fullmatch(r"(\d+)([GM])", text.upper())
+    if not m:
+        raise Fail("sizes look like 16G or 8192M")
+    return int(m.group(1)) << (30 if m.group(2) == "G" else 20)
+
+
+# ---------- commands ----------
+
+def cmd_start(a):
+    conf = settings()
+    inst = Instance(a.name)
+    if inst.running():
+        say(f"Instance '{inst.name}' is already running at {inst.url()}")
+        open_view(inst, a.open or conf["open"])
+        return
+    need("qemu-system-aarch64", "qemu-img", "ssh-keygen")
+    firmware_args()
+    state = inst.state
+    if state and a.build and str(a.build) != state["build"]:
+        raise Fail(f"instance '{inst.name}' was created from build {state['build']}. Use `f1emu reset -n {inst.name}` "
+                   f"first, or a second instance: `f1emu start -n other --build {a.build}`.")
+    if state:
+        build_dir = BUILDS / f"{state['build']}-{state['variant']}"
+        if not (build_dir / "meta.json").exists():
+            raise Fail(f"build {state['build']} was removed but instance '{inst.name}' depends on it; "
+                       f"run `f1emu reset -n {inst.name}`")
+        meta = json.loads((build_dir / "meta.json").read_text()) | {"dir": str(build_dir)}
+    else:
+        if a.build is None and a.variant is None and "build" not in conf and (have := local_builds()):
+            meta = have[-1]
+        else:
+            meta = fetch(a.build, a.variant)
+    profile = a.profile or state.get("profile") or conf["profile"]
+    entry = pick_entry(meta, profile, a.kernel)
+    boot = boot_files(meta, entry)
+    inst.dir.mkdir(parents=True, exist_ok=True)
+    root = Path(meta["dir"]) / "root.btrfs"
+    grown = False
+    if not inst.disk.exists():
+        size = parse_size(a.disk_size) if a.disk_size else None
+        if size and size < root.stat().st_size:
+            raise Fail(f"--disk-size must be at least {root.stat().st_size >> 30} G")
+        run(["qemu-img", "create", "-q", "-f", "qcow2", "-F", "raw", "-b", root, inst.disk] + ([str(size)] if size else []))
+        grown = bool(size)
+    elif a.disk_size:
+        raise Fail("--disk-size only applies when the instance is created; run `f1emu reset` first")
+    taken = {p for other in all_instances() if other.name != inst.name and other.running()
+             for p in (other.state["port"], other.state["ssh_port"])}
+    listen = a.listen or conf["listen"]
+    port = free_port(listen, a.port or conf["port"], taken)
+    opts = {
+        "listen": listen, "port": port,
+        "ssh_port": free_port("127.0.0.1", a.ssh_port or conf["ssh_port"], taken | {port}),
+        "memory": a.memory or conf["memory"], "cpus": a.cpus or conf["cpus"],
+        "append": a.append or "", "forward": a.forward, "network": not a.no_network,
+        "ephemeral": a.ephemeral, "display": a.display, "qemu_arg": a.qemu_arg,
+    }
+    inst.save(build=meta["name"], variant=meta["variant"], profile=entry["profile"], kernel=entry["version"],
+              port=opts["port"], ssh_port=opts["ssh_port"], listen=listen, ephemeral=a.ephemeral)
+    cmd = qemu_command(inst, meta, entry, boot, opts)
+    if a.print_command:
+        print(" ".join(f"'{c}'" if " " in c else c for c in cmd))
+        return
+    for stale in (inst.console, inst.qmp_sock, inst.pid_file):
+        stale.unlink(missing_ok=True)
+    say(f"Starting Flipper OS build {meta['name']}, profile {entry['profile']}, kernel {entry['version']}")
+    if entry["profile"] != "Minimal":
+        warn("only the Flipper panel is emulated; this profile's HDMI desktop has no screen here")
+    with open(inst.qemu_log, "w") as log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    try:
+        took = wait_ready(inst, proc, a.timeout or conf["boot_timeout"])
+    except KeyboardInterrupt:
+        proc.terminate()
+        raise Fail("interrupted; the emulator was stopped")
+    if grown:
+        inst.ssh("btrfs filesystem resize max /", root=True, check=False)
+    say(f"Flipper OS is up after {took:.0f}s")
+    print(f"    Remote view : {inst.url()}\n    App manager : {inst.url('apps')}\n"
+          f"    Shell       : f1emu ssh{'' if inst.name == 'default' else ' -n ' + inst.name}")
+    if opts["port"] != (a.port or conf["port"]):
+        warn(f"port {a.port or conf['port']} was busy, using {opts['port']}")
+    open_view(inst, a.open or conf["open"])
+
+
+def cmd_stop(a):
+    targets = all_instances() if a.all else [Instance(a.name)]
+    for inst in targets:
+        pid = inst.pid()
+        if not pid:
+            if not a.all:
+                say(f"Instance '{inst.name}' is not running")
+            continue
+        if not a.force:
+            say(f"Shutting down '{inst.name}'")
+            try:
+                inst.ssh("systemctl poweroff", root=True, timeout=15, check=False)
+            except (Fail, subprocess.TimeoutExpired):
+                pass
+            for _ in range(60):
+                if not inst.running():
+                    break
+                time.sleep(0.5)
+        if inst.running():
+            if not a.force:
+                warn("the OS did not shut down by itself; stopping the emulator")
+            try:
+                inst.qmp("quit")
+            except (OSError, Fail):
+                os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                if not inst.running():
+                    break
+                time.sleep(0.25)
+        inst.pid_file.unlink(missing_ok=True)
+        say(f"Instance '{inst.name}' stopped")
+
+
+def cmd_status(a):
+    instances = all_instances()
+    if not instances:
+        print("No instances yet. Run `f1emu start`.")
+        return
+    for inst in instances:
+        s = inst.state
+        line = f"{inst.name:12} {'running' if inst.running() else 'stopped':8} build {s['build']:6} {s['profile']:12}"
+        if inst.running():
+            line += f" {inst.url()}  ssh :{s['ssh_port']}" + ("  (ephemeral)" if s.get("ephemeral") else "")
+        elif inst.disk.exists():
+            line += f" disk {inst.disk.stat().st_size / 1e6:.0f} MB of changes"
+        print(line)
+
+
+def cmd_open(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    open_view(inst, a.how)
+    print(inst.url())
+
+
+def cmd_ssh(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    base, target = inst.ssh_base(root=a.root)
+    os.execvp("ssh", base + [target] + a.command)
+
+
+def cmd_copy(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    base, target = inst.ssh_base("scp", root=a.root)
+    sources, dest = (a.paths[:-1], a.paths[-1]) if len(a.paths) > 1 else (a.paths, None)
+    if a.cmd == "push":
+        args = [*sources, f"{target}:{dest or 'Files/'}"]
+    else:
+        args = [*(f"{target}:{p}" for p in sources), dest or "."]
+    run(base + ["-r", *args], capture_output=False)
+
+
+def cmd_press(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    for key in a.keys:
+        http(inst.url("input"), {"key": key, "down": True})
+        time.sleep(a.hold)
+        http(inst.url("input"), {"key": key, "down": False})
+        time.sleep(a.gap)
+
+
+def read_panel(inst, wait=3.0):
+    """One full frame from the device's own stream: (x, y, w, h) header, then 8-bit grey."""
+    canvas = bytearray(PANEL_W * PANEL_H)
+    covered = False
+    deadline = time.monotonic() + wait
+    with urllib.request.urlopen(inst.url("stream"), timeout=wait + 5) as res:
+        while not covered and time.monotonic() < deadline:
+            x, y, w, h = struct.unpack("<4H", res.read(8))
+            data = res.read(w * h)
+            for row in range(h):
+                canvas[(y + row) * PANEL_W + x:(y + row) * PANEL_W + x + w] = data[row * w:(row + 1) * w]
+            covered = w == PANEL_W and h == PANEL_H
+    if not covered:
+        raise Fail("the device sent no full frame")
+    return canvas
+
+
+def write_png(path, width, height, rgb):
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
+    raw = b"".join(b"\0" + rgb[y * width * 3:(y + 1) * width * 3] for y in range(height))
+    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+                           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def cmd_screenshot(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    if a.vt:
+        with tempfile.NamedTemporaryFile(suffix=".ppm", dir=inst.dir) as tmp:
+            inst.qmp("screendump", filename=tmp.name)
+            m = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\s", data := Path(tmp.name).read_bytes())
+            write_png(a.path, int(m.group(1)), int(m.group(2)), data[m.end():])
+    else:
+        grey = read_panel(inst)
+        tint = (255, 255, 255) if a.grey else AMBER
+        lut = [bytes(c * v // 255 for c in tint) * a.scale for v in range(256)]
+        rows = (b"".join(lut[v] for v in grey[y * PANEL_W:(y + 1) * PANEL_W]) for y in range(PANEL_H))
+        write_png(a.path, PANEL_W * a.scale, PANEL_H * a.scale, b"".join(row * a.scale for row in rows))
+    say(f"Saved {a.path}")
+
+
+def cmd_apps(a):
+    inst = Instance(a.name)
+    inst.require_running()
+    apps = json.loads(http(inst.url("apps.json")))
+    if apps.get("error"):
+        warn(f"app catalogue: {apps['error']}")
+    if a.action == "list":
+        for app in apps["installed"]:
+            print(f"installed  {app['name']}")
+        for app in apps["offered"]:
+            if not app["installed"]:
+                print(f"available  {app['name']:28} {app['size']:>8}  {app['folder']}")
+        return
+    pool = apps["offered"] if a.action == "install" else apps["installed"]
+    matches = [x for x in pool if x["name"].lower() == a.app.lower()] or [x for x in pool if a.app.lower() in x["name"].lower()]
+    if len(matches) != 1:
+        raise Fail(f"'{a.app}' matches {len(matches)} apps: {', '.join(m['name'] for m in matches) or 'none'}")
+    app = matches[0]
+    body = {"path": app["path"]} if a.action == "install" else {"key": app["key"]}
+    answer = json.loads(http(inst.url(f"apps/{a.action}"), body, timeout=600))
+    if not answer.get("ok"):
+        raise Fail(f"{app['name']}: {answer.get('said', 'the device refused')}")
+    say(f"{app['name']}: {answer.get('said', 'done')}")
+
+
+def cmd_log(a):
+    inst = Instance(a.name)
+    if a.journal:
+        inst.require_running()
+        base, target = inst.ssh_base(root=True)
+        os.execvp("ssh", base + [target, "journalctl", "-b", "--no-pager"] + (["-f"] if a.follow else ["-n", str(a.lines)]))
+    if not inst.console.exists():
+        raise Fail(f"instance '{inst.name}' has no console log yet")
+    os.execvp("tail", ["tail", "-n", str(a.lines)] + (["-f"] if a.follow else []) + [str(inst.console)])
+
+
+def cmd_reset(a):
+    inst = Instance(a.name)
+    if inst.running():
+        raise Fail(f"stop instance '{inst.name}' first")
+    if not inst.dir.exists():
+        raise Fail(f"there is no instance '{inst.name}'")
+    if not a.yes and input(f"Erase everything stored inside instance '{inst.name}'? [y/N] ").lower() != "y":
+        return
+    shutil.rmtree(inst.dir)
+    say(f"Instance '{inst.name}' is back to factory state; the next start uses the configured build")
+
+
+def cmd_snapshot(a):
+    inst = Instance(a.name)
+    need("qemu-img")
+    if a.action == "list":
+        print(run(["qemu-img", "snapshot", "-U", "-l", inst.disk]).stdout.strip() or "no snapshots")
+        return
+    if inst.running():
+        raise Fail("stop the instance first; snapshots are taken of the disk at rest")
+    flag = {"save": "-c", "load": "-a", "delete": "-d"}[a.action]
+    run(["qemu-img", "snapshot", flag, a.tag, inst.disk])
+    say(f"Snapshot '{a.tag}': {a.action} done")
+
+
+def cmd_builds(a):
+    if a.remote:
+        local = {b["name"] for b in local_builds()}
+        for number, name, mtime in remote_builds(a.branches)[-a.count:]:
+            print(f"{name:40} {mtime[:16].replace('T', ' ')}{'  (downloaded)' if name in local else ''}")
+        return
+    used = {(i.state["build"], i.state["variant"]): i.name for i in all_instances()}
+    for b in local_builds():
+        size = sum(f.stat().st_blocks * 512 for f in Path(b["dir"]).rglob("*") if f.is_file())
+        profiles = sorted({e["profile"] for e in b["entries"] if e["bootable"]})
+        owner = used.get((b["name"], b["variant"]))
+        print(f"{b['name']:8} {b['variant']:14} {size / 1e9:4.1f} GB  built {b['built'][:10]}  "
+              f"profiles: {', '.join(profiles)}{'  used by ' + owner if owner else ''}")
+    if not local_builds():
+        print("Nothing downloaded yet. `f1emu fetch` gets the newest build.")
+
+
+def cmd_fetch(a):
+    meta = fetch(a.build, a.variant, a.keep_download)
+    say(f"Build {meta['name']} ({meta['variant']}) is ready in {meta['dir']}")
+
+
+def cmd_profiles(a):
+    builds = [b for b in local_builds() if a.build is None or b["name"] == str(a.build)]
+    if not builds:
+        raise Fail("that build is not downloaded; see `f1emu builds`")
+    for e in builds[-1]["entries"]:
+        print(f"{e['profile']:14} kernel {e['version']:28} {'' if e['bootable'] else 'cannot boot in QEMU (no virtio)'}")
+
+
+def cmd_rm_build(a):
+    for b in local_builds():
+        if b["name"] == str(a.build) and (a.variant is None or b["variant"] == a.variant):
+            users = [i.name for i in all_instances() if (i.state["build"], i.state["variant"]) == (b["name"], b["variant"])]
+            if users:
+                raise Fail(f"build {b['name']} is the base of instance(s) {', '.join(users)}; reset them first")
+            shutil.rmtree(b["dir"])
+            say(f"Removed build {b['name']} ({b['variant']})")
+            return
+    raise Fail("that build is not downloaded")
+
+
+def cmd_doctor(a):
+    ok = True
+    for tool, package in TOOLS.items():
+        path = shutil.which(tool)
+        ok &= bool(path)
+        print(f"{'ok ' if path else 'MISSING'} {tool:22} {path or 'install ' + package}")
+    firmware = next((p for p, _ in FIRMWARE if os.path.exists(p)), None)
+    ok &= bool(firmware)
+    print(f"{'ok ' if firmware else 'MISSING'} {'UEFI firmware':22} {firmware or 'install edk2-aarch64 / qemu-efi-aarch64'}")
+    kvm = platform.machine() == "aarch64" and os.access("/dev/kvm", os.R_OK | os.W_OK)
+    print(f"ok  {'CPU':22} {platform.machine()}, {'KVM (native speed)' if kvm else 'software emulation (TCG)'}")
+    DATA.mkdir(parents=True, exist_ok=True)
+    print(f"ok  {'data directory':22} {DATA} ({shutil.disk_usage(DATA).free / 1e9:.0f} GB free)")
+    if not ok:
+        raise Fail("some requirements are missing")
+
+
+def cmd_desktop(a):
+    entry = Path.home() / ".local/share/applications/flipper-one-emu.desktop"
+    if a.action == "remove":
+        entry.unlink(missing_ok=True)
+        say("Launcher removed")
+        return
+    entry.parent.mkdir(parents=True, exist_ok=True)
+    entry.write_text("[Desktop Entry]\nType=Application\nName=Flipper One Emulator\n"
+                     "Comment=Boot the real Flipper One OS in QEMU\n"
+                     f"Exec={Path(__file__).resolve()} start --open app\nTerminal=true\n"
+                     "Icon=computer\nCategories=Development;Emulator;\n")
+    say(f"Launcher written to {entry}")
+
+
+def cmd_purge(a):
+    running = [i.name for i in all_instances() if i.running()]
+    if running:
+        raise Fail(f"stop these first: {', '.join(running)}")
+    if not a.yes and input(f"Delete {DATA} with all builds and instances? [y/N] ").lower() != "y":
+        return
+    shutil.rmtree(DATA, ignore_errors=True)
+    say("Everything removed")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="f1emu", description="Run the real Flipper One OS in QEMU on Linux.")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    def add(name, fn, text, instance=True):
+        sp = sub.add_parser(name, help=text, description=text)
+        sp.set_defaults(fn=fn)
+        if instance:
+            sp.add_argument("-n", "--name", default="default", help="instance name (default: default)")
+        return sp
+
+    s = add("start", cmd_start, "boot Flipper OS (downloads the newest build on first use)")
+    s.add_argument("--build", help="build number, e.g. 2494 (default: newest downloaded, else newest online)")
+    s.add_argument("--variant", help=f"board image to use (default: {DEFAULTS['variant']})")
+    s.add_argument("--profile", help="OS profile: Minimal, Desktop, Router, TV-Media-Box, No-Graphics")
+    s.add_argument("--kernel", help="pick a kernel whose version contains this text")
+    s.add_argument("-m", "--memory", type=int, help=f"guest RAM in MB (default: {DEFAULTS['memory']})")
+    s.add_argument("-c", "--cpus", type=int, help=f"guest CPUs (default: {DEFAULTS['cpus']})")
+    s.add_argument("-p", "--port", type=int, help=f"host port of the remote view (default: {DEFAULTS['port']})")
+    s.add_argument("--ssh-port", type=int, help=f"host port of the guest's SSH (default: {DEFAULTS['ssh_port']})")
+    s.add_argument("--listen", help="address the remote view binds to; 0.0.0.0 shares it on your network")
+    s.add_argument("--forward", action="append", default=[], metavar="HOST:GUEST[/udp]", help="forward one more port (repeatable)")
+    s.add_argument("--no-network", action="store_true", help="cut the guest off from the internet")
+    s.add_argument("--disk-size", metavar="SIZE", help="grow the disk when creating the instance, e.g. 16G")
+    s.add_argument("--ephemeral", action="store_true", help="throw away all changes when the emulator stops")
+    s.add_argument("--open", choices=("browser", "app", "none"), help="how to show the device once it is up")
+    s.add_argument("--display", default="none", choices=("none", "gtk", "sdl"), help="show QEMU's own window (boot console)")
+    s.add_argument("--append", help="extra kernel command line")
+    s.add_argument("--qemu-arg", action="append", default=[], metavar="ARG", help="extra QEMU argument (repeatable)")
+    s.add_argument("--timeout", type=int, help=f"seconds to wait for the OS (default: {DEFAULTS['boot_timeout']})")
+    s.add_argument("--print-command", action="store_true", help="print the QEMU command instead of running it")
+
+    s = add("stop", cmd_stop, "shut the OS down cleanly")
+    s.add_argument("--force", action="store_true", help="kill the emulator without a clean shutdown")
+    s.add_argument("--all", action="store_true", help="stop every instance")
+
+    add("status", cmd_status, "list instances", instance=False)
+
+    s = add("open", cmd_open, "open the remote view of a running instance")
+    s.add_argument("how", nargs="?", default="browser", choices=("browser", "app", "none"))
+
+    s = add("ssh", cmd_ssh, "open a shell in the guest, or run a command there")
+    s.add_argument("--root", action="store_true", help="log in as root instead of user")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+
+    for name, text in (("push", "copy files into the guest (default target: ~/Files/)"),
+                       ("pull", "copy files out of the guest (default target: current directory)")):
+        s = add(name, cmd_copy, text)
+        s.add_argument("--root", action="store_true")
+        s.add_argument("paths", nargs="+", metavar="PATH", help="sources, then an optional destination")
+
+    s = add("press", cmd_press, "press device buttons: " + " ".join(KEYS))
+    s.add_argument("keys", nargs="+", choices=KEYS, metavar="KEY")
+    s.add_argument("--hold", type=float, default=0.08, help="seconds each key is held (default: 0.08)")
+    s.add_argument("--gap", type=float, default=0.15, help="seconds between keys (default: 0.15)")
+
+    s = add("screenshot", cmd_screenshot, "save the panel as a PNG")
+    s.add_argument("path")
+    s.add_argument("--scale", type=int, default=4, help="integer upscale (default: 4)")
+    s.add_argument("--grey", action="store_true", help="raw greyscale instead of the amber backlight")
+    s.add_argument("--vt", action="store_true", help="capture the boot console instead of the panel")
+
+    s = add("apps", cmd_apps, "list, install, run or remove Flipper apps")
+    s.add_argument("action", choices=("list", "install", "run", "remove"))
+    s.add_argument("app", nargs="?", help="app name or a unique part of it")
+
+    s = add("log", cmd_log, "show the boot console log")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.add_argument("--lines", type=int, default=60)
+    s.add_argument("--journal", action="store_true", help="show the guest's systemd journal instead")
+
+    s = add("reset", cmd_reset, "factory reset: erase the instance's disk")
+    s.add_argument("-y", "--yes", action="store_true")
+
+    s = add("snapshot", cmd_snapshot, "save or restore the disk of a stopped instance")
+    s.add_argument("action", choices=("list", "save", "load", "delete"))
+    s.add_argument("tag", nargs="?")
+
+    s = add("builds", cmd_builds, "list downloaded builds, or those on the server", instance=False)
+    s.add_argument("--remote", action="store_true", help="list official builds on the server")
+    s.add_argument("--branches", action="store_true", help="with --remote: include test-branch builds")
+    s.add_argument("--count", type=int, default=15, help="with --remote: how many (default: 15)")
+
+    s = add("fetch", cmd_fetch, "download and prepare a build without starting it", instance=False)
+    s.add_argument("build", nargs="?", help="build number (default: newest)")
+    s.add_argument("--variant")
+    s.add_argument("--keep-download", action="store_true", help="keep the compressed image")
+
+    s = add("profiles", cmd_profiles, "list profiles and kernels of a downloaded build", instance=False)
+    s.add_argument("build", nargs="?")
+
+    s = add("rm-build", cmd_rm_build, "delete a downloaded build", instance=False)
+    s.add_argument("build")
+    s.add_argument("--variant")
+
+    add("doctor", cmd_doctor, "check that everything needed is installed", instance=False)
+
+    s = add("desktop", cmd_desktop, "add or remove an application-menu launcher", instance=False)
+    s.add_argument("action", choices=("install", "remove"))
+
+    s = add("purge", cmd_purge, "delete all builds, instances and keys", instance=False)
+    s.add_argument("-y", "--yes", action="store_true")
+
+    a = p.parse_args()
+    if a.cmd == "apps" and a.action != "list" and not a.app:
+        p.error("apps install/run/remove need an app name")
+    if a.cmd == "snapshot" and a.action != "list" and not a.tag:
+        p.error("snapshot save/load/delete need a tag")
+    try:
+        a.fn(a)
+    except Fail as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
