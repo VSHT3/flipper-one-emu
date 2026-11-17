@@ -31,10 +31,10 @@ should not.
   internet is reachable).
 
 ## Reliability
-
-- CI: the Ubuntu boot sometimes hangs before the kernel prints anything
-  (empty console, 15-minute timeout). One of three runs on the same code
-  failed. Find the cause; until then print QEMU and firmware versions and
+- CI: the Ubuntu boot often hangs before the kernel prints anything (empty
+  console, 15-minute timeout). Two of the last three runs failed, with no
+  change to the boot code between them. Find the cause; until then print
+  QEMU and firmware versions and the boot screen in the failing run.
   the boot screen in the failing run.
 - Build the simulator modules from scratch through `f1emu sim on` on a clean
   machine. So far they were built by hand and put in the cache. Add it to CI.
