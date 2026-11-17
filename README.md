@@ -47,7 +47,7 @@ picture or use the keyboard: arrows, Enter, Backspace, Tab, `z x c v b`, `a`.
 | `apps list\|install\|run\|remove` | The device's App Manager from the terminal |
 | `apps add FILE` | Copy your own `.fap.AppImage` or `.fap.py` into the device's app list |
 | `sim on [wifi battery modem laptop]` | Load pretend hardware (see below); `sim status` shows it |
-| `sim battery LEVEL`, `sim usb none\|charger\|device` | Set the battery, and what is plugged into USB-C1 |
+| `sim battery LEVEL`, `sim usb none\|charger\|device\|laptop` | Set the battery, and what is plugged into USB-C1 |
 | `sim modem --signal N --operator NAME --tech lte\|5gnr` | Set what the 5G modem screen reports |
 | `sim laptop on\|off\|run CMD` | A pretend laptop on ETH1 that gets its internet from the Flipper |
 | `sim pcap FILE [--seconds N]` | Capture the simulated Wi-Fi air, WPA2 handshakes included |
@@ -89,7 +89,10 @@ inside a throwaway instance; that takes a few minutes and is cached.
   has a handshake in it. Every signal is full strength.
 - **Battery and USB-C1:** a fake battery (`test_power`). The level, a charger,
   or a device drawing power from the Flipper can be set; the OS shows the
-  matching power flow.
+  matching power flow. `sim usb laptop` plugs in a computer: the OS brings up
+  its USB network link (`flipusb0`) and gives the laptop its address, as it
+  does on the real device. Sharing the internet over that link is added by
+  the simulator; the OS itself only provides the link.
 - **5G modem:** stand-ins for `mmcli`, `qmicli` and `nmcli` that answer the
   Flipper's interface with made-up readings. The screens fill in; no data
   flows. The RSRP line shows `lte` instead of a number.

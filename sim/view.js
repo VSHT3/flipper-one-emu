@@ -43,10 +43,9 @@
     .f1layer { position: absolute; left: -50%; top: -50%; width: 200%; height: 200%; pointer-events: none; }
     #f1cables { z-index: 1; }
     #f1leds { z-index: 3; }
-    #f1cables .cable { transition: transform .28s cubic-bezier(.3, 1.4, .5, 1), opacity .2s; }
-    #f1cables .cable.out { opacity: .38; }
+    #f1cables .cable { transition: transform .22s ease-out; }
     #f1cables .cable.click { pointer-events: auto; cursor: pointer; }
-    #f1cables .cable.click.out:hover { opacity: .75; }
+    #f1cables .cable.click:hover { filter: brightness(1.15); }
     #f1cables text { font: 500 24px system-ui, sans-serif; fill: #8A9099; }
     #f1leds .lamp { transition: fill .15s, opacity .15s; }
     #f1leds .blink { animation: f1blink 1.1s steps(2, jump-none) infinite; }
@@ -84,31 +83,30 @@
   // tip sits `depth` pixels further in, hidden behind the body.
   const cables = layer('f1cables');
   const art = await (await fetch('f1emu/cables/cables.json')).json();
-  const cable = (picture, mouth, depth, clickable) => {
+  const cable = (picture, mouth, clickable) => {
     const a = art[picture];
     const turn = a.degrees * Math.PI / 180;
     const [dx, dy] = [Math.cos(turn), Math.sin(turn)];
-    const tip = [mouth[0] - dx * depth, mouth[1] - dy * depth];
-    const g = node('g', { class: 'cable out' + (clickable ? ' click' : '') }, cables);
+    const tip = [mouth[0] - dx * a.hidden, mouth[1] - dy * a.hidden];
+    const g = node('g', { class: 'cable' + (clickable ? ' click' : '') }, cables);
     node('image', { href: `f1emu/cables/${picture}.png`, x: tip[0] - a.tip_x, y: tip[1] - a.tip_y,
                     width: a.width, height: a.height }, g);
-    // Unplugged, it hangs back along its own direction.
+    // Unplugged, it lies pulled back along its own direction, clear of the socket.
     g.plug = plugged => {
-      g.classList.toggle('out', !plugged);
-      g.style.transform = plugged ? '' : `translate(${dx * 80}px, ${dy * 80}px)`;
+      g.style.transform = plugged ? '' : `translate(${dx * 150}px, ${dy * 150}px)`;
     };
     g.plug(false);
     return g;
   };
   const lines = {
-    eth0: cable('eth-grey', [244, 396], 178, false),
-    eth1: cable('eth-orange', [163, 506], 178, true),
-    usb: cable('usb-c', [1819, 598], 72, true),
-    hdmi: cable('hdmi', [687, 172], 120, false),
+    eth0: cable('eth-grey', [276, 352], false),
+    eth1: cable('eth-black', [195, 462], true),
+    usb: cable('usb-c', [1819, 598], true),
+    hdmi: cable('hdmi', [687, 172], false),
   };
   const labels = {
     eth0: node('text', { x: 300, y: 140 }, cables),
-    eth1: node('text', { x: 20, y: 560, 'text-anchor': 'end' }, cables),
+    eth1: node('text', { x: 0, y: 790 }, cables),
     usb: node('text', { x: 1856, y: 506 }, cables),
     hdmi: node('text', { x: 800, y: 112 }, cables),
   };
@@ -194,8 +192,10 @@
     note.textContent = 'Loading. The first time this builds the simulators, which takes a few minutes.';
     act('on');
   });
+  // What is on the far end of the USB-C cable: nothing, a charger, a phone the
+  // Flipper charges, or a laptop that powers the Flipper and gets its internet.
   lines.usb.addEventListener('click', () => {
-    const next = { none: 'charger', charger: 'device', device: 'none' }[state.cable || 'none'];
+    const next = { none: 'charger', charger: 'device', device: 'laptop', laptop: 'none' }[state.cable || 'none'];
     lines.usb.plug(next !== 'none');
     act('usb', next);
   });
@@ -221,7 +221,8 @@
     labels.eth0.textContent = 'ETH0 · network';
     labels.eth1.textContent = state.eth1 ? 'ETH1 · laptop' : 'ETH1 · click to plug in';
     labels.usb.textContent = bat ? { none: 'USB-C1 · click to plug in', charger: 'USB-C1 · charger',
-                                     device: 'USB-C1 · charging a phone' }[cableIn] : '';
+                                     device: 'USB-C1 · charging a phone',
+                                     laptop: 'USB-C1 · laptop' }[cableIn] : '';
     labels.hdmi.textContent = state.video ? 'HDMI · monitor window' : '';
 
     light(lamp.eth0, state.eth0 ? GREEN : null);
@@ -238,7 +239,7 @@
     ['chev1', 'chev2', 'chev3', 'chev4'].forEach((name, i) => lightMeter(lamp[name], i < input ? SCALE[i] : null));
     lightMeter(lamp.battery, bat ? GREEN : null);
     lightMeter(lamp.bolt, bat && state.charging ? GREEN : null);
-    lightMeter(lamp.plug, bat && cableIn === 'charger' ? RED : null);
+    lightMeter(lamp.plug, bat && (cableIn === 'charger' || cableIn === 'laptop') ? RED : null);
 
     battery.hidden = !bat;
     signal.hidden = !has('modem');
@@ -246,6 +247,9 @@
     if (has('modem') && document.activeElement !== signal.input) { signal.input.value = state.signal; signal.value.textContent = state.signal; }
   }
   async function refresh() {
+    // While a click is still being carried out the guest reports the old state;
+    // showing it would yank the cable back out and in again.
+    if (busy) return;
     try {
       const res = await fetch('f1emu/state', { cache: 'no-store' });
       const next = await res.json();

@@ -1,30 +1,34 @@
 {
  "usb-c": {
-  "width": 2213.4,
-  "height": 305.3,
-  "tip_x": 152.6,
-  "tip_y": 152.6,
+  "width": 1901.5,
+  "height": 471.0,
+  "tip_x": 122.1,
+  "tip_y": 122.1,
+  "hidden": 57.6,
   "degrees": 0.0
  },
  "hdmi": {
-  "width": 305.3,
-  "height": 2213.4,
-  "tip_x": 152.6,
-  "tip_y": 2060.7,
+  "width": 244.2,
+  "height": 1901.5,
+  "tip_x": 122.1,
+  "tip_y": 1779.4,
+  "hidden": 95.9,
   "degrees": -90.0
  },
  "eth-grey": {
-  "width": 1845.0,
-  "height": 1432.2,
-  "tip_x": 1692.4,
-  "tip_y": 1279.6,
+  "width": 1694.9,
+  "height": 1223.0,
+  "tip_x": 1572.8,
+  "tip_y": 1100.9,
+  "hidden": 126.5,
   "degrees": 216.2
  },
- "eth-orange": {
-  "width": 1845.0,
-  "height": 1432.2,
-  "tip_x": 1692.4,
-  "tip_y": 1279.6,
+ "eth-black": {
+  "width": 1664.0,
+  "height": 1223.0,
+  "tip_x": 1541.9,
+  "tip_y": 1100.9,
+  "hidden": 126.5,
   "degrees": 216.2
  }
 }

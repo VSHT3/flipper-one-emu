@@ -1111,6 +1111,8 @@ USB_STATES = {
     "none": ("off", "off", "discharging", -125000),
     "charger": ("on", "on", "charging", 1000000),
     "device": ("off", "on", "discharging", -1200000),
+    # A laptop both powers the Flipper, modestly, and is the computer on its USB link.
+    "laptop": ("off", "on", "charging", 450000),
 }
 SIM_STATE = r"""
 p=/sys/module/test_power/parameters
@@ -1180,7 +1182,8 @@ def sim_on(inst, kinds):
     inst.ssh("mountpoint -q /run/f1emu || { mkdir -p /run/f1emu && mount -t tmpfs -o exec,mode=755 tmpfs /run/f1emu; }; "
              "mkdir -p /run/f1emu/bin /run/f1emu/modem /run/f1emu/shims", root=True)
     scp, target = inst.ssh_base("scp", root=True)
-    run(scp + [*(modules / f"{m}.ko" for m in SIM_MODULES.values()), SIM_DIR / "wifi.sh", SIM_DIR / "laptop.sh",
+    run(scp + [*(modules / f"{m}.ko" for m in SIM_MODULES.values()),
+               SIM_DIR / "wifi.sh", SIM_DIR / "laptop.sh", SIM_DIR / "usbpc.sh",
                f"{target}:/run/f1emu/"])
     run(scp + [*(SIM_DIR / name for name in ("mmcli", "qmicli", "nmcli")), f"{target}:/run/f1emu/shims/"])
     steps, restart = [], False
@@ -1235,7 +1238,7 @@ def sim_state(inst):
         # into the battery plus the same idle draw the device needs for itself.
         "charging": watts > 0,
         "draw_w": round(max(0.0, -watts), 2),
-        "input_w": round(watts + 0.96, 2) if raw["cable"] == "charger" else 0.0,
+        "input_w": round(watts + 0.96, 2) if raw["cable"] in ("charger", "laptop") else 0.0,
     }
 
 
@@ -1266,10 +1269,13 @@ def cmd_sim(a):
         mains, usb, status, current = USB_STATES[first]
         done = inst.ssh(f"cd /sys/module/test_power/parameters && echo {mains} > ac_online && echo {usb} > usb_online && "
                         f"echo {status} > battery_status && echo {current} > battery_current && "
-                        f"echo {first} > /run/f1emu/cable", root=True, check=False)
+                        f"echo {first} > /run/f1emu/cable && "
+                        f"sh /run/f1emu/usbpc.sh {'up' if first == 'laptop' else 'down'} 2>&1",
+                        root=True, timeout=60, check=False)
         if done.returncode:
-            raise Fail("the simulated battery is not loaded; run `f1emu sim on battery`")
-        say({"none": "USB-C unplugged", "charger": "Charger plugged in", "device": "Flipper is powering a device"}[first])
+            raise Fail(done.stdout.strip()[-300:] or "the simulated battery is not loaded; run `f1emu sim on battery`")
+        say({"none": "USB-C unplugged", "charger": "Charger plugged in", "device": "Flipper is powering a device",
+             "laptop": "Laptop on USB-C: it powers the Flipper and is online through it"}[first])
     elif a.action == "laptop":
         if first == "on":
             sim_on(inst, ["laptop"])
@@ -1277,8 +1283,10 @@ def cmd_sim(a):
             inst.ssh("sh /run/f1emu/laptop.sh down", root=True, check=False)
             say("Laptop unplugged")
         elif first == "run" and a.values[1:]:
+            # Whichever laptop is plugged in; the one on ETH1 if both are.
             base, target = inst.ssh_base(root=True)
-            os.execvp("ssh", base + ["-t", target, "ip netns exec laptop " + shlex.join(a.values[1:])])
+            os.execvp("ssh", base + ["-t", target, "ip netns exec $(ip netns list | grep -oE '^(laptop|usblaptop)' "
+                                     "| sort | head -1) " + shlex.join(a.values[1:])])
         else:
             raise Fail("use `sim laptop on`, `sim laptop off` or `sim laptop run COMMAND`")
     elif a.action == "pcap":
@@ -1490,7 +1498,7 @@ def main():
     s = add("sim", cmd_sim, "pretend hardware: Wi-Fi networks, battery, USB-C cable, 5G modem, a laptop on ETH1, captures")
     s.add_argument("action", choices=("on", "battery", "usb", "modem", "laptop", "pcap", "status"))
     s.add_argument("values", nargs="*", help="on: wifi battery modem laptop (default: the first three); battery: level 0-100; "
-                   "usb: none, charger or device; laptop: on, off or run COMMAND; pcap: file to save")
+                   "usb: none, charger, device or laptop; laptop: on, off or run COMMAND; pcap: file to save")
     s.add_argument("--charging", action="store_true", help="battery: plugged in")
     s.add_argument("--discharging", action="store_true", help="battery: on battery power")
     s.add_argument("--signal", type=int, help="modem: signal quality 0-100")
@@ -1548,6 +1556,9 @@ def main():
     except Fail as e:
         print(f"error: {e}", file=sys.stderr)
         notify(f"Error: {e}")
+        sys.exit(1)
+    except subprocess.TimeoutExpired as e:
+        print(f"error: the guest did not answer within {e.timeout:.0f} s", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
