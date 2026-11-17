@@ -83,6 +83,9 @@ Data lives in `~/.local/share/flipper-one-emu`.
   an SSH key, and a drop-in for `flipctl.service` that drops the missing
   `seat1` and selects software rendering. Without the drop-in the menus work
   but apps do not start.
+- The address you open is a small local proxy in front of the device's web
+  page. It passes everything through and adds one script that redraws the
+  256x144 panel at a whole multiple, so text stays even at any window size.
 
 ## Limits
 
