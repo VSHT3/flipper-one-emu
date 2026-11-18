@@ -2,6 +2,7 @@
 # f1emu: radio details for the pretend modem, in qmicli's own wording.
 S=/run/f1emu/modem
 sig=$(cat $S/signal 2>/dev/null || echo 74)
+op=$(cat $S/operator 2>/dev/null || echo "Test Network")
 rsrp=$(( -140 + sig * 96 / 100 ))
 case " $* " in
   *" --nas-get-serving-system "*) cat <<T
@@ -16,7 +17,7 @@ case " $* " in
 	Current PLMN:
 		MCC: '001'
 		MNC: '01'
-		Description: 'Test Network'
+		Description: '$op'
 	3GPP location area code: '65534'
 	3GPP cell ID: '26385411'
 	LTE tracking area code: '12345'

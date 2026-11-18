@@ -5,6 +5,7 @@ case "$*" in
   "-t -f DEVICE,TYPE device")
     /usr/bin/nmcli "$@"; echo "cdc-wdm0:gsm";;
   "-t -f DEVICE,TYPE,STATE,CONNECTION,IP4-CONNECTIVITY,IP6-CONNECTIVITY device")
-    /usr/bin/nmcli "$@"; echo "cdc-wdm0:gsm:connected:Test Network:full:none";;
+    /usr/bin/nmcli "$@"
+    echo "cdc-wdm0:gsm:connected:$(cat /run/f1emu/modem/operator 2>/dev/null || echo "Test Network"):full:none";;
   *) exec /usr/bin/nmcli "$@";;
 esac

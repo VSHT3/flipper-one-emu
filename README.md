@@ -35,18 +35,23 @@ f1emu status
 
 The remote view is at `http://127.0.0.1:8899/`. Click the buttons on the
 picture or use the keyboard: arrows, Enter, Backspace, Tab, `z x c v b`, `a`.
+The column on its right holds what the emulator adds: the simulated
+hardware, the video output, screenshots, snapshots, factory reset and shut
+down. It runs commands in the guest for whoever can open the page, so think
+before sharing it with `--listen 0.0.0.0`.
 
 | Command | What it does |
 |---|---|
-| `start` | Boot. Options: `--build`, `--variant`, `--profile`, `--kernel`, `-m`, `-c`, `-p`, `--ssh-port`, `--listen`, `--forward`, `--no-network`, `--no-audio`, `--mic`, `--disk-size`, `--ephemeral`, `--open browser\|app\|none`, `--display gtk`, `--append`, `--qemu-arg`, `-n NAME` |
+| `start` | Boot. Options: `--build`, `--variant`, `--profile`, `--kernel`, `-m`, `-c`, `-p`, `--ssh-port`, `--listen`, `--forward`, `--no-network`, `--no-audio`, `--mic`, `--sim`, `--video`, `--disk-size`, `--ephemeral`, `--open browser\|app\|none`, `--display gtk`, `--append`, `--qemu-arg`, `-n NAME` |
 | `stop [--force] [--all]` | Clean shutdown, or kill |
+| `restart [--reset]` | Stop and start again with the options of the last start; `--reset` erases the disk in between |
 | `ssh [--root] [-- CMD]` | Shell in the guest (`user` has passwordless sudo) |
 | `push` / `pull` | Copy files in and out (`push` defaults to `~/Files/`) |
 | `mount DIR [GUEST_DIR]` / `umount` | Show the device's `~/Files` (or another folder) as a folder on the PC |
 | `audio on\|off [--mic]` | Connect the guest's sound, and optionally the PC microphone, while it runs |
 | `apps list\|install\|run\|remove` | The device's App Manager from the terminal |
 | `apps add FILE` | Copy your own `.fap.AppImage` or `.fap.py` into the device's app list |
-| `sim on [wifi battery modem laptop]` | Load pretend hardware (see below); `sim status` shows it |
+| `sim on [wifi battery modem laptop video]` | Load pretend hardware (see below); `sim status` shows it |
 | `sim battery LEVEL`, `sim usb none\|charger\|device\|laptop` | Set the battery, and what is plugged into USB-C1 |
 | `sim modem --signal N --operator NAME --tech lte\|5gnr` | Set what the 5G modem screen reports |
 | `sim laptop on\|off\|run CMD` | A pretend laptop on ETH1 that gets its internet from the Flipper |
@@ -54,7 +59,7 @@ picture or use the keyboard: arrows, Enter, Backspace, Tab, `z x c v b`, `a`.
 | `press KEY...` | Press device buttons |
 | `screenshot FILE [--scale N] [--grey] [--vt] [--video]` | Save the panel (or the boot console, or the video output) as PNG |
 | `log [-f] [--journal]` | Boot console or systemd journal |
-| `snapshot save\|load\|delete\|list` | Disk snapshots of a stopped instance |
+| `snapshot save\|load\|delete\|list` | Snapshots. Of a stopped instance, its disk. Of a running one, disk and memory: `load` goes back to that moment without a boot |
 | `reset` | Factory reset one instance |
 | `builds [--remote]`, `fetch`, `profiles`, `rm-build` | Manage downloaded OS builds |
 | `desktop install\|remove` | Application-menu launcher |
@@ -98,15 +103,33 @@ inside a throwaway instance; that takes a few minutes and is cached.
   flows. The RSRP line shows `lte` instead of a number.
 - **Laptop on ETH1:** a second machine on a virtual cable. The Flipper shares
   its connection with it, and `sim laptop run` runs commands on it.
-- **Video output:** `f1emu start --video` adds a display, a keyboard and a
-  pointer and opens them in a window. The Desktop profile's KDE session
-  appears there after a minute or two; it is slow.
+- **Video output:** every instance has a screen, a keyboard and a pointer on
+  its video port. `f1emu start --video`, `sim on video` or **Turn on** in the
+  remote view loads the drivers for them. The picture is shown in the remote
+  view; click it to use it with mouse and keyboard. The Desktop profile's KDE
+  session appears there after a minute or two; it is slow. The Minimal
+  profile has no desktop, so its screen stays dark until an app draws on it.
 
-In the remote view the cables are shown at the device's real ports and
-plug in with a click, and the power meter and the status lights follow the
-simulated state. The power meter lights the way Flipper's hardware docs
-describe; how many watts one segment stands for is a guess (3 W). What the
-LINK light means is also a guess: green when the internet is reachable.
+In the remote view the cables are shown at the device's real ports. ETH1
+plugs in with a click, USB-C1 asks what to plug in. The lights follow the
+simulated state:
+
+- ETH0, ETH1 and WI-FI light while their port has a link, in the colours
+  Flipper OS sets (`99-network-leds.rules` in its build scripts). The OS
+  does not drive LINK, which is left for apps, so it stays dark.
+- The power meter follows Flipper's own
+  [power meter emulator](https://dev.repetren.com/power_meter_demo/), the
+  reference for the firmware
+  ([issue 254](https://github.com/flipperdevices/flipperone-mcu-firmware/issues/254)):
+  bars for watts from the battery (one more every 2 W up to 8 W, colours
+  beyond), chevrons for watts coming in (above 0, 7.5, 15 and 27 W). The
+  firmware is unfinished and the published hardware docs draw it differently,
+  so the real device may end up otherwise.
+
+Tested in the page on build 2494, Minimal profile: every control of the
+column, live snapshots, factory reset, shut down, and mouse and keyboard
+reaching the guest's input devices. Not tested: the video output with the
+Desktop profile's session, and more than one browser.
 
 LoRa and the other radios are not simulated: nothing in the OS shows them.
 

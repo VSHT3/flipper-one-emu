@@ -30,6 +30,7 @@ import threading
 import time
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from pathlib import Path
@@ -407,9 +408,9 @@ class Instance:
         host = self.state["listen"]
         return f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{self.state['port']}/{path}"
 
-    def qmp(self, command, **arguments):
+    def qmp(self, command, _timeout=10, **arguments):
         with socket.socket(socket.AF_UNIX) as s:
-            s.settimeout(10)
+            s.settimeout(_timeout)
             s.connect(str(self.qmp_sock))
             f = s.makefile("rw")
             f.readline()
@@ -420,6 +421,13 @@ class Instance:
                     if "error" in reply:
                         raise Fail(f"QEMU refused {command}: {reply['error']['desc']}")
             return reply["return"]
+
+    def hmp(self, line, timeout=10):
+        """One command of QEMU's human monitor, which reports a failure in its answer."""
+        said = self.qmp("human-monitor-command", _timeout=timeout, **{"command-line": line}).strip()
+        if said.startswith("Error: "):
+            raise Fail(said.removeprefix("Error: "))
+        return said
 
     def ssh_base(self, tool="ssh", root=False):
         port_flag = "-P" if tool == "scp" else "-p"
@@ -533,14 +541,12 @@ def qemu_command(inst, meta, entry, boot, opts):
            "-pidfile", str(inst.pid_file)]
     if opts["ephemeral"]:
         cmd.append("-snapshot")
-    display = opts["display"]
-    if opts["video"]:
-        # The stand-in for the HDMI port: a second screen, with a keyboard and a pointer.
-        cmd += ["-device", "virtio-gpu-device,id=video0,xres=1280,yres=720",
-                "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device"]
-        if display == "none" and "gtk" in run(["qemu-system-aarch64", "-display", "help"]).stdout:
-            display = "gtk"
-    cmd += ["-display", display] + opts["qemu_arg"]
+    # The stand-in for the HDMI port: a second screen, with a keyboard and a
+    # pointer. Always there, as the port is, and dark until `video_on()` gives
+    # the guest its drivers. The remote view shows it, so it needs no window.
+    cmd += ["-device", "virtio-gpu-device,id=video0,xres=1280,yres=720",
+            "-device", "virtio-keyboard-device", "-device", "virtio-tablet-device",
+            "-display", opts["display"]] + opts["qemu_arg"]
     return cmd
 
 
@@ -697,11 +703,11 @@ def cmd_start(a):
         "guest_port": free_port("127.0.0.1", port + 10000 if port < 55000 else 18899, taken | {port, ssh_port}),
         "memory": a.memory or conf["memory"], "cpus": a.cpus or conf["cpus"],
         "append": a.append or "", "forward": a.forward, "network": not a.no_network,
-        "ephemeral": a.ephemeral, "display": a.display, "qemu_arg": a.qemu_arg, "video": a.video,
+        "ephemeral": a.ephemeral, "display": a.display, "qemu_arg": a.qemu_arg,
     }
     inst.save(build=meta["name"], variant=meta["variant"], profile=entry["profile"], kernel=entry["version"],
               port=opts["port"], ssh_port=opts["ssh_port"], guest_port=opts["guest_port"], listen=listen,
-              ephemeral=a.ephemeral)
+              ephemeral=a.ephemeral, start_args=a.start_args)
     cmd = qemu_command(inst, meta, entry, boot, opts)
     if a.print_command:
         print(" ".join(f"'{c}'" if " " in c else c for c in cmd))
@@ -709,8 +715,8 @@ def cmd_start(a):
     for stale in (inst.console, inst.qmp_sock, inst.pid_file):
         stale.unlink(missing_ok=True)
     say(f"Starting Flipper OS build {meta['name']}, profile {entry['profile']}, kernel {entry['version']}")
-    if entry["profile"] != "Minimal":
-        warn("only the Flipper panel is emulated; this profile's HDMI desktop has no screen here")
+    if entry["profile"] != "Minimal" and not a.video:
+        warn("this profile's desktop is on the video output; turn it on with --video or in the remote view")
     with open(inst.qemu_log, "w") as log:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     try:
@@ -857,12 +863,31 @@ def read_panel(inst, wait=3.0):
     return canvas
 
 
-def write_png(path, width, height, rgb):
+def png(width, height, rgb):
     def chunk(tag, data):
         return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data))
     raw = b"".join(b"\0" + rgb[y * width * 3:(y + 1) * width * 3] for y in range(height))
-    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-                           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def panel_png(inst, scale=4, grey=False):
+    """The panel as a PNG, in the amber of its backlight unless the raw greys are asked for."""
+    pixels = read_panel(inst)
+    tint = (255, 255, 255) if grey else AMBER
+    lut = [bytes(c * v // 255 for c in tint) * scale for v in range(256)]
+    rows = (b"".join(lut[v] for v in pixels[y * PANEL_W:(y + 1) * PANEL_W]) for y in range(PANEL_H))
+    return png(PANEL_W * scale, PANEL_H * scale, b"".join(row * scale for row in rows))
+
+
+def video_png(inst):
+    """What is on the video output, as a PNG straight from QEMU."""
+    with tempfile.NamedTemporaryFile(suffix=".png", dir=inst.dir) as tmp:
+        try:
+            inst.qmp("screendump", filename=tmp.name, device="video0", format="png")
+        except Fail as e:
+            raise Fail(f"instance '{inst.name}' has no video port; stop and start it") from e
+        return Path(tmp.name).read_bytes()
 
 
 def video_on(inst):
@@ -874,36 +899,38 @@ def video_on(inst):
     """
     if inst.ssh("test -e /dev/dri/card0", root=True, check=False).returncode == 0:
         return
+    try:
+        inst.qmp("qom-get", path="/machine/peripheral/video0", property="type")
+    except Fail as e:
+        raise Fail(f"instance '{inst.name}' was started by an older f1emu, without the video port; "
+                   "stop and start it") from e
     modules = sim_modules(inst)
     scp, target = inst.ssh_base("scp", root=True)
     inst.ssh("mkdir -p /lib/modules/$(uname -r)/extra", root=True)
     run(scp + [*(modules / f"{m}.ko" for m in VIDEO_MODULES), f"{target}:/lib/modules/{inst.state['kernel']}/extra/"])
+    # Only the profiles with a desktop have a display manager to wake up.
     done = inst.ssh("depmod -a && modprobe virtio_dma_buf && modprobe virtio-gpu && modprobe virtio_input && "
-                    "systemctl try-restart sddm 2>&1", root=True, timeout=120, check=False)
+                    "if systemctl cat sddm >/dev/null 2>&1; then systemctl try-restart sddm && echo desktop; fi 2>&1",
+                    root=True, timeout=120, check=False)
     if done.returncode:
         raise Fail(done.stdout.strip()[-400:] or "the display driver did not load")
-    say("Video output is on; the desktop takes a minute or two to appear")
+    say("Video output is on; " + ("the desktop takes a minute or two to appear" if "desktop" in done.stdout else
+                                  "this profile has no desktop, so the screen stays dark until an app draws on it"))
 
 
 def cmd_screenshot(a):
     inst = Instance(a.name)
     inst.require_running()
     if a.video:
-        try:
-            inst.qmp("screendump", filename=os.path.abspath(a.path), device="video0", format="png")
-        except Fail as e:
-            raise Fail("this instance has no video output; start it with `f1emu start --video`") from e
+        picture = video_png(inst)
     elif a.vt:
         with tempfile.NamedTemporaryFile(suffix=".ppm", dir=inst.dir) as tmp:
             inst.qmp("screendump", filename=tmp.name)
             m = re.match(rb"P6\s+(\d+)\s+(\d+)\s+255\s", data := Path(tmp.name).read_bytes())
-            write_png(a.path, int(m.group(1)), int(m.group(2)), data[m.end():])
+            picture = png(int(m.group(1)), int(m.group(2)), data[m.end():])
     else:
-        grey = read_panel(inst)
-        tint = (255, 255, 255) if a.grey else AMBER
-        lut = [bytes(c * v // 255 for c in tint) * a.scale for v in range(256)]
-        rows = (b"".join(lut[v] for v in grey[y * PANEL_W:(y + 1) * PANEL_W]) for y in range(PANEL_H))
-        write_png(a.path, PANEL_W * a.scale, PANEL_H * a.scale, b"".join(row * a.scale for row in rows))
+        picture = panel_png(inst, a.scale, a.grey)
+    Path(a.path).write_bytes(picture)
     say(f"Saved {a.path}")
 
 
@@ -996,16 +1023,57 @@ def cmd_reset(a):
     say(f"Instance '{inst.name}' is back to factory state; the next start uses the configured build")
 
 
+def cmd_restart(a):
+    """Stop the instance and start it again the way it was started last time."""
+    inst = Instance(a.name)
+    args = inst.state.get("start_args")
+    if args is None:
+        raise Fail(f"instance '{inst.name}' was last started by an older f1emu; use `f1emu stop` and `f1emu start`")
+    me = [sys.executable, os.path.abspath(__file__)]
+    run(me + ["stop", "-n", inst.name], capture_output=False)
+    if a.reset:
+        shutil.rmtree(inst.dir)
+    # Whoever asked is already looking at the remote view; do not open another.
+    os.execv(sys.executable, me + ["start", *args, "--open", "none"])
+
+
+def snapshots(inst):
+    """The tags of the instance's snapshots. A running QEMU holds the disk, so it is asked instead."""
+    if inst.running():
+        rows = inst.hmp("info snapshots").splitlines()
+    else:
+        rows = run(["qemu-img", "snapshot", "-l", inst.disk]).stdout.splitlines()
+    start = next((i for i, row in enumerate(rows) if row.startswith("ID")), len(rows))
+    return [row.split()[1] for row in rows[start + 1:] if len(row.split()) > 1]
+
+
 def cmd_snapshot(a):
     inst = Instance(a.name)
     need("qemu-img")
+    live = inst.running()
     if a.action == "list":
-        print(run(["qemu-img", "snapshot", "-U", "-l", inst.disk]).stdout.strip() or "no snapshots")
+        listed = inst.hmp("info snapshots") if live else run(["qemu-img", "snapshot", "-l", inst.disk]).stdout
+        print(listed.strip() or "no snapshots")
         return
-    if inst.running():
-        raise Fail("stop the instance first; snapshots are taken of the disk at rest")
-    flag = {"save": "-c", "load": "-a", "delete": "-d"}[a.action]
-    run(["qemu-img", "snapshot", flag, a.tag, inst.disk])
+    if not re.fullmatch(r"[\w.-]{1,40}", a.tag):
+        raise Fail("snapshot names are up to 40 letters, digits, '_', '.' and '-'")
+    if not live:
+        flag = {"save": "-c", "load": "-a", "delete": "-d"}[a.action]
+        run(["qemu-img", "snapshot", flag, a.tag, inst.disk])
+    elif a.action == "load":
+        # Of a running instance the memory is saved too: loading goes back to
+        # that very moment, with no boot. QEMU leaves the guest paused after it.
+        try:
+            inst.hmp(f"loadvm {a.tag}", timeout=300)
+        finally:
+            inst.qmp("cont")
+        # The guest's clock went back with it.
+        try:
+            inst.ssh(f"date -s @{int(time.time())}", root=True, check=False)
+        except subprocess.TimeoutExpired:
+            pass
+    else:
+        inst.hmp(f"{'savevm' if a.action == 'save' else 'delvm'} {a.tag}", timeout=300)
     say(f"Snapshot '{a.tag}': {a.action} done")
 
 
@@ -1127,14 +1195,22 @@ echo cable=$(cat /run/f1emu/cable 2>/dev/null)
 echo signal=$(cat /run/f1emu/modem/signal 2>/dev/null)
 echo online=$(/usr/bin/nmcli -t -f CONNECTIVITY general 2>/dev/null)
 echo mods=$(lsmod | grep -oE '^(mac80211_hwsim|test_power|wwan_hwsim)' | tr '\n' ,)
+echo operator=$(cat /run/f1emu/modem/operator 2>/dev/null)
+echo tech=$(cat /run/f1emu/modem/tech 2>/dev/null)
+echo ssid=$(iw dev wlan0 link 2>/dev/null | sed -n 's/^[[:space:]]*SSID: //p')
+echo lap_eth1=$(ip netns exec laptop ip -4 -o addr show eth0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\).*/\1/p')
+echo lap_usb=$(ip netns exec usblaptop ip -4 -o addr show usb0 2>/dev/null | sed -n 's/.* inet \([0-9.]*\).*/\1/p')
+sed -n 's/^ ssid="\(.*\)"$/net=\1/p; s/^ psk="\(.*\)"$/psk=\1/p' /run/f1emu/ap?.conf 2>/dev/null
+true
 """
 
 
 def sim_kinds(names):
     names = list(SIM_DEFAULT) if not names or "all" in names else names
-    unknown = set(names) - set(SIM_MODULES)
+    kinds = (*SIM_MODULES, "video")
+    unknown = set(names) - set(kinds)
     if unknown:
-        raise Fail(f"unknown simulator {', '.join(sorted(unknown))}; there are: {', '.join(SIM_MODULES)}")
+        raise Fail(f"unknown simulator {', '.join(sorted(unknown))}; there are: {', '.join(kinds)}")
     return sorted(set(names))
 
 
@@ -1178,6 +1254,11 @@ def sim_on(inst, kinds):
     Everything goes into a tmpfs of its own: /run is mounted noexec, and the
     modem stand-ins have to be executable.
     """
+    if "video" in kinds:
+        video_on(inst)
+        kinds = [kind for kind in kinds if kind != "video"]
+        if not kinds:
+            return
     modules = sim_modules(inst)
     inst.ssh("mountpoint -q /run/f1emu || { mkdir -p /run/f1emu && mount -t tmpfs -o exec,mode=755 tmpfs /run/f1emu; }; "
              "mkdir -p /run/f1emu/bin /run/f1emu/modem /run/f1emu/shims", root=True)
@@ -1219,7 +1300,15 @@ def sim_on(inst, kinds):
 
 def sim_state(inst):
     """What the pretend hardware is doing right now, read from the guest itself."""
-    raw = dict(line.split("=", 1) for line in inst.ssh(SIM_STATE, root=True, timeout=15).stdout.splitlines() if "=" in line)
+    raw, networks = {}, []
+    for line in inst.ssh(SIM_STATE, root=True, timeout=15).stdout.splitlines():
+        key, found, value = line.partition("=")
+        if key == "net":
+            networks.append({"ssid": value, "password": None})
+        elif key == "psk" and networks:
+            networks[-1]["password"] = value
+        elif found:
+            raw[key] = value
     watts = int(raw["current"] or 0) * int(raw["voltage"] or 0) / 1e12
     sim = [kind for kind, module in SIM_MODULES.items() if module in raw["mods"]]
     if raw["eth1"]:
@@ -1234,12 +1323,41 @@ def sim_state(inst):
         "cable": raw["cable"] or "none",
         "signal": int(raw["signal"] or 74),
         "video": raw["video"] == "1",
+        "operator": raw["operator"] or "Test Network",
+        "tech": raw["tech"] or "5gnr",
+        # The network the Flipper has joined, the ones around it, and the
+        # address each plugged-in laptop got from the Flipper.
+        "ssid": raw["ssid"] or None,
+        "networks": networks,
+        "laptops": {"eth1": raw["lap_eth1"] or None, "usb": raw["lap_usb"] or None},
         # Watts out of the battery, and watts coming in through USB-C1: what goes
         # into the battery plus the same idle draw the device needs for itself.
         "charging": watts > 0,
         "draw_w": round(max(0.0, -watts), 2),
         "input_w": round(watts + 0.96, 2) if raw["cable"] in ("charger", "laptop") else 0.0,
     }
+
+
+LAPTOPS = {"eth1": "laptop", "usb": "usblaptop"}     # port: the network namespace its laptop lives in
+
+
+def laptop_run(inst, port, command, timeout=30):
+    """Run a shell command on a plugged-in laptop; what it printed."""
+    done = inst.ssh(f"ip netns exec {LAPTOPS[port]} timeout {timeout} sh -c {shlex.quote(command)} 2>&1",
+                    root=True, timeout=timeout + 15, check=False)
+    return done.stdout
+
+
+def sim_pcap(inst, seconds, dest):
+    """Record the simulated Wi-Fi air into a file on this PC."""
+    done = inst.ssh("ip link set hwsim0 up && "
+                    "{ ip netns exec f1phone wpa_cli -p /run/f1emu/phone -i wlan4 reassociate >/dev/null; "
+                    f"timeout {seconds} tcpdump -q -i hwsim0 -w /run/f1emu/air.pcap 2>&1 | tail -1; }}",
+                    root=True, timeout=seconds + 30, check=False)
+    if done.returncode:
+        raise Fail("the simulated Wi-Fi is not loaded; run `f1emu sim on wifi`")
+    scp, target = inst.ssh_base("scp", root=True)
+    run(scp + [f"{target}:/run/f1emu/air.pcap", dest])
 
 
 def cmd_sim(a):
@@ -1276,6 +1394,25 @@ def cmd_sim(a):
             raise Fail(done.stdout.strip()[-300:] or "the simulated battery is not loaded; run `f1emu sim on battery`")
         say({"none": "USB-C unplugged", "charger": "Charger plugged in", "device": "Flipper is powering a device",
              "laptop": "Laptop on USB-C: it powers the Flipper and is online through it"}[first])
+    elif a.action == "modem":
+        sets = {}
+        if a.signal is not None:
+            if not 0 <= a.signal <= 100:
+                raise Fail("the signal is a number from 0 to 100")
+            sets["signal"] = str(a.signal)
+        if a.operator is not None:
+            if not re.fullmatch(r"[\w .-]{1,24}", a.operator):
+                raise Fail("the operator's name is up to 24 letters, digits, spaces, '.', '_' and '-'")
+            sets["operator"] = a.operator
+        if a.tech:
+            sets["tech"] = a.tech
+        if not sets:
+            raise Fail("give --signal, --operator or --tech")
+        done = inst.ssh("lsmod | grep -q '^wwan_hwsim' && " + " && ".join(
+            f"echo {shlex.quote(value)} > /run/f1emu/modem/{name}" for name, value in sets.items()), root=True, check=False)
+        if done.returncode:
+            raise Fail("the simulated modem is not loaded; run `f1emu sim on modem`")
+        say("Modem set")
     elif a.action == "laptop":
         if first == "on":
             sim_on(inst, ["laptop"])
@@ -1292,14 +1429,7 @@ def cmd_sim(a):
     elif a.action == "pcap":
         if not first:
             raise Fail("name the file to save the capture to")
-        done = inst.ssh("ip link set hwsim0 up && "
-                        "{ ip netns exec f1phone wpa_cli -p /run/f1emu/phone -i wlan4 reassociate >/dev/null; "
-                        f"timeout {a.seconds} tcpdump -q -i hwsim0 -w /run/f1emu/air.pcap 2>&1 | tail -1; }}",
-                        root=True, timeout=a.seconds + 30, check=False)
-        if done.returncode:
-            raise Fail("the simulated Wi-Fi is not loaded; run `f1emu sim on wifi`")
-        scp, target = inst.ssh_base("scp", root=True)
-        run(scp + [f"{target}:/run/f1emu/air.pcap", first])
+        sim_pcap(inst, a.seconds, first)
         say(f"Saved {first} ({os.path.getsize(first) // 1024} KB of simulated air, {a.seconds} s)")
     else:
         state = sim_state(inst)
@@ -1309,10 +1439,11 @@ def cmd_sim(a):
             print(inst.ssh("/usr/bin/nmcli -t -f SSID,SIGNAL,SECURITY device wifi list | sed 's/^/           /'",
                            root=True).stdout.rstrip())
         print(f"battery  {'on, %d%%, USB-C: %s' % (state['level'], state['cable']) if 'battery' in on else 'off'}")
-        print(f"modem    {'on, signal %d%%' % state['signal'] if 'modem' in on else 'off'}")
-        print(f"laptop   {'plugged into ETH1' if 'laptop' in on else 'off'}")
+        print(f"modem    {'on, %s, %s, signal %d%%' % (state['operator'], state['tech'], state['signal']) if 'modem' in on else 'off'}")
+        print(f"laptop   {'plugged into ETH1, ' + (state['laptops']['eth1'] or 'no address yet') if 'laptop' in on else 'off'}")
 
 
+# What the page may ask `f1emu sim` for.
 VIEW_ACTIONS = ("on", "battery", "modem", "usb", "laptop")
 
 
@@ -1320,9 +1451,12 @@ def cmd_viewer(a):
     """Internal: the view proxy. Passes everything to the device and adds f1emu's own layer."""
     inst = Instance(a.name)
     state = inst.state
-    me = [sys.executable, os.path.abspath(__file__), "sim", "-n", inst.name]
+    me = [sys.executable, os.path.abspath(__file__)]
+    named = ["-n", inst.name]
     cache = {"at": 0.0, "body": b"{}"}
     lock = threading.Lock()
+    # QEMU's monitor talks to one caller at a time.
+    monitor = threading.Lock()
 
     def sim_json():
         with lock:
@@ -1334,9 +1468,32 @@ def cmd_viewer(a):
                 cache["at"] = time.monotonic()
             return cache["body"]
 
+    def do(args):
+        """Carry out one of the page's requests by running the f1emu command for it."""
+        if not args or not all(re.fullmatch(r"[\w .=-]{1,48}", x) for x in args):
+            raise ValueError
+        if args in (["stop"], ["restart"], ["restart", "--reset"]):
+            # Both end this proxy too, so the command must outlive it.
+            subprocess.Popen(me + [args[0], *named, *args[1:]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return {"ok": True, "said": ""}
+        if args[0] == "snapshot" and len(args) == 3 and args[1] in ("save", "load", "delete"):
+            with monitor:
+                done = subprocess.run(me + ["snapshot", *named, *args[1:]], capture_output=True, text=True, timeout=700)
+        elif args[0] in VIEW_ACTIONS:
+            done = subprocess.run(me + ["sim", *named, *args], capture_output=True, text=True, timeout=3700)
+        else:
+            raise ValueError
+        with lock:
+            cache["at"] = 0.0
+        said = (done.stderr or done.stdout).strip().splitlines()[-1:] or [""]
+        return {"ok": done.returncode == 0, "said": said[0]}
+
     class Relay(http_server.BaseHTTPRequestHandler):
-        def answer(self, body, kind="application/json"):
-            self.send_response(200)
+        def answer(self, body, kind="application/json", status=200):
+            if not isinstance(body, bytes):
+                body = json.dumps(body).encode()
+            self.send_response(status)
             self.send_header("Content-Type", kind)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
@@ -1345,33 +1502,63 @@ def cmd_viewer(a):
 
         def own(self, path, body):
             asset = re.fullmatch(r"/f1emu/((?:cables/)?[\w-]+\.(js|json|png))", path)
-            if asset and (SIM_DIR / asset.group(1)).is_file():
+            if path == "/favicon.ico":
+                self.answer((SIM_DIR / "favicon.png").read_bytes(), "image/png")
+            elif asset and (SIM_DIR / asset.group(1)).is_file():
                 kind = {"js": "text/javascript", "json": "application/json", "png": "image/png"}[asset.group(2)]
                 self.answer((SIM_DIR / asset.group(1)).read_bytes(), kind)
             elif path == "/f1emu/state":
                 self.answer(sim_json())
-            elif path == "/f1emu/do" and self.command == "POST":
-                try:
-                    args = json.loads(body or b"{}")["args"]
-                    if args[0] not in VIEW_ACTIONS or not all(re.fullmatch(r"-{0,2}[\w.]{1,32}", str(x)) for x in args):
-                        raise ValueError
-                except (ValueError, KeyError, IndexError, TypeError):
-                    self.send_error(400)
-                    return
-                done = subprocess.run(me + [str(x) for x in args], capture_output=True, text=True, timeout=3700)
-                with lock:
-                    cache["at"] = 0.0
-                said = (done.stderr or done.stdout).strip().splitlines()[-1:] or [""]
-                self.answer(json.dumps({"ok": done.returncode == 0, "said": said[0]}).encode())
+            elif path == "/f1emu/snapshots":
+                with monitor:
+                    self.answer(snapshots(inst))
+            elif path == "/f1emu/screenshot.png":
+                self.answer(panel_png(inst), "image/png")
+            elif path == "/f1emu/video.png":
+                with monitor:
+                    picture = video_png(inst)
+                self.answer(picture, "image/png")
+            elif path == "/f1emu/pcap":
+                asked = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("seconds", ["15"])
+                with tempfile.NamedTemporaryFile(suffix=".pcap", dir=inst.dir) as tmp:
+                    sim_pcap(inst, min(120, max(1, int(asked[0]))), tmp.name)
+                    self.answer(Path(tmp.name).read_bytes(), "application/vnd.tcpdump.pcap")
+            elif self.command != "POST":
+                self.send_error(404)
+            elif path == "/f1emu/do":
+                self.answer(do([str(x) for x in json.loads(body)["args"]]))
+            elif path == "/f1emu/run":
+                asked = json.loads(body)
+                self.answer({"ok": True, "said": laptop_run(inst, asked["laptop"], str(asked["command"])[:500])})
+            elif path == "/f1emu/input":
+                # Mouse and keyboard for the video output, in QEMU's own wording.
+                events = json.loads(body)["events"]
+                if not isinstance(events, list) or len(events) > 200:
+                    raise ValueError
+                with monitor:
+                    inst.qmp("input-send-event", events=events)
+                self.answer({"ok": True})
             else:
                 self.send_error(404)
 
         def relay(self):
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0)) or None
             path = self.path.split("?")[0]
-            if path.startswith("/f1emu/"):
+            if path.startswith("/f1emu/") or path == "/favicon.ico":
+                # The page's own requests come from this address. Anything else is
+                # another website open in the same browser, reaching for the emulator.
+                origin = self.headers.get("Origin")
+                if origin and urllib.parse.urlsplit(origin).netloc != self.headers.get("Host"):
+                    self.send_error(403)
+                    return
                 try:
                     self.own(path, body)
+                except Fail as e:
+                    self.answer({"ok": False, "said": str(e)}, status=409)
+                except subprocess.TimeoutExpired:
+                    self.answer({"ok": False, "said": "the guest did not answer"}, status=409)
+                except (ValueError, KeyError, IndexError, TypeError):
+                    self.send_error(400)
                 except OSError:
                     pass
                 return
@@ -1440,7 +1627,7 @@ def main():
     s.add_argument("--mic", action="store_true", help="also give the guest this PC's microphone")
     s.add_argument("--sim", metavar="KINDS", help="pretend hardware to load: all, or a comma list of wifi,battery,modem")
     s.add_argument("--no-sim", action="store_true", help="ignore the `sim` setting of the config file")
-    s.add_argument("--video", action="store_true", help="give the device a screen on its video output, in a window")
+    s.add_argument("--video", action="store_true", help="turn the video output on; it is shown in the remote view")
     s.add_argument("--disk-size", metavar="SIZE", help="grow the disk when creating the instance, e.g. 16G")
     s.add_argument("--ephemeral", action="store_true", help="throw away all changes when the emulator stops")
     s.add_argument("--open", choices=("browser", "app", "none"), help="how to show the device once it is up")
@@ -1497,8 +1684,9 @@ def main():
 
     s = add("sim", cmd_sim, "pretend hardware: Wi-Fi networks, battery, USB-C cable, 5G modem, a laptop on ETH1, captures")
     s.add_argument("action", choices=("on", "battery", "usb", "modem", "laptop", "pcap", "status"))
-    s.add_argument("values", nargs="*", help="on: wifi battery modem laptop (default: the first three); battery: level 0-100; "
-                   "usb: none, charger, device or laptop; laptop: on, off or run COMMAND; pcap: file to save")
+    s.add_argument("values", nargs="*", help="on: wifi battery modem laptop video (default: the first three); "
+                   "battery: level 0-100; usb: none, charger, device or laptop; laptop: on, off or run COMMAND; "
+                   "pcap: file to save")
     s.add_argument("--charging", action="store_true", help="battery: plugged in")
     s.add_argument("--discharging", action="store_true", help="battery: on battery power")
     s.add_argument("--signal", type=int, help="modem: signal quality 0-100")
@@ -1514,7 +1702,11 @@ def main():
     s = add("reset", cmd_reset, "factory reset: erase the instance's disk")
     s.add_argument("-y", "--yes", action="store_true")
 
-    s = add("snapshot", cmd_snapshot, "save or restore the disk of a stopped instance")
+    s = add("restart", cmd_restart, "stop and start again with the options of the last start")
+    s.add_argument("--reset", action="store_true", help="factory reset in between: erase the instance's disk")
+
+    s = add("snapshot", cmd_snapshot, "save or go back to a state: the disk of a stopped instance, "
+            "disk and memory of a running one")
     s.add_argument("action", choices=("list", "save", "load", "delete"))
     s.add_argument("tag", nargs="?")
 
@@ -1547,6 +1739,7 @@ def main():
     sub.choices["_viewer"].add_argument("-n", "--name", default="default")
 
     a = p.parse_args()
+    a.start_args = sys.argv[2:]
     if a.cmd == "apps" and a.action != "list" and not a.app:
         p.error("apps install/run/remove/add need an app name or file")
     if a.cmd == "snapshot" and a.action != "list" and not a.tag:

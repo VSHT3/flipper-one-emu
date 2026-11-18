@@ -4,31 +4,15 @@ What is left, most useful first within each section.
 
 ## Remote view (web UI)
 
-Today the page can press buttons, plug cables by clicking them, and set the
-battery level and 5G signal. Everything else below needs a terminal and
-should not.
-
-- Favicon for the page.
-- Capture button: record the simulated Wi-Fi air for N seconds and download
-  the `.pcap`.
-- Laptop panel: show each plugged-in laptop's address and run a command on it
-  (or a small terminal), instead of `f1emu sim laptop run`.
-- Modem controls: operator name and LTE/5G next to the signal slider.
-- Wi-Fi panel: list the simulated networks with their passwords.
-- USB-C1 chooser: pick charger, phone or laptop from a small menu. Cycling
-  through them by repeated clicks is hard to discover.
-- Screenshot button.
-- Snapshot, factory reset and shut down buttons.
-- A way to start the video output from the page and see it there, not in a
-  separate QEMU window.
-- The two Ethernet cables sag by different amounts and cross each other.
-  Give them the same curve.
-- The HDMI cable has never been looked at on the device.
-- Re-check by clicking that cables no longer jump back out while a click is
-  being carried out. The cause is fixed, the result was not re-tested.
-- Two guesses to replace with facts: how many watts one power meter segment
-  stands for (3 W assumed), and what the LINK light means (green when the
-  internet is reachable).
+- The video output with the Desktop profile: the picture and the input were
+  tested with a test pattern only, never with the KDE session.
+- Minimal profile: put a text console on the video output, so there is
+  something to see and type into.
+- Wi-Fi panel: join a network from the page.
+- Run on a laptop: a real terminal instead of one command at a time.
+- A password for the page when it is shared with `--listen 0.0.0.0`.
+- The power meter follows Flipper's emulator of it. Check against the
+  firmware once it drives the meter (flipperone-mcu-firmware issue 254).
 
 ## Reliability
 
@@ -38,9 +22,8 @@ should not.
   QEMU and firmware versions and the boot screen in the failing run.
 - Build the simulator modules from scratch through `f1emu sim on` on a clean
   machine. So far they were built by hand and put in the cache. Add it to CI.
-- Never run: `--display gtk`, using the `--video` window with mouse and
-  keyboard, joining Wi-Fi from the device's own menu, recording from the
-  microphone, `--open app`.
+- Never run: `--display gtk`, joining Wi-Fi from the device's own menu,
+  recording from the microphone, `--open app`.
 - Never tried: Fedora, an ARM64 host with KVM.
 - The Router profile boots but its remote view and SSH do not answer.
 - CI actions warn about an outdated Node.js runtime; update them.

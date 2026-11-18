@@ -202,8 +202,9 @@ CABLES = {
     "usb-c": (usb_c, 0.0, 26),
     "hdmi": (hdmi, -90.0, 0),
     # Perpendicular to the slanted upper-left face the Ethernet sockets are in.
+    # Both sag alike: they run side by side, and unequal curves would cross.
     "eth-grey": (rj45("grey"), 216.2, 22),
-    "eth-black": (rj45("black"), 216.2, 16),
+    "eth-black": (rj45("black"), 216.2, 22),
 }
 
 
