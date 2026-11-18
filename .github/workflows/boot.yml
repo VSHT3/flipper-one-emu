@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install requirements
         run: |
           sudo apt-get update
@@ -26,15 +26,45 @@ jobs:
           ./f1emu ssh -- uname -a
           ./f1emu apps list
           ./f1emu press view
-          sleep 2
+          ./f1emu wait screen menu
+          ./f1emu screen --json
           ./f1emu screenshot panel.png
           ./f1emu stop
-      - name: Show the boot log on failure
+      # A boot that hangs leaves nothing in the log; what the machine was and
+      # where it stands is all there is to go on.
+      - name: Say what the failed boot looked like
         if: failure()
-        run: ./f1emu log --lines 200 || true
-      - uses: actions/upload-artifact@v4
+        run: |
+          qemu-system-aarch64 --version | head -1
+          dpkg -s qemu-efi-aarch64 | grep Version
+          nproc; grep -m1 'model name' /proc/cpuinfo
+          ./f1emu log --lines 200 || true
+          cat ~/.local/share/flipper-one-emu/instances/default/qemu.log || true
+          ./f1emu screenshot --vt boot-screen.png || true
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: panel
-          path: panel.png
+          path: |
+            panel.png
+            boot-screen.png
           if-no-files-found: ignore
+
+  # Compiling the simulators inside an emulated guest takes the runner a long
+  # time, so not on every push.
+  simulators:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-arm qemu-efi-aarch64 qemu-utils zstd btrfs-progs openssh-client
+      - name: Boot and build the simulators from nothing
+        run: |
+          ./f1emu start --open none --no-audio --timeout 900
+          ./f1emu sim on
+          ./f1emu sim status --json
+          ./f1emu stop

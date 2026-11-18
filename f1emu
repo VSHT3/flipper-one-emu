@@ -10,6 +10,7 @@ and ssh on the host.
 """
 import argparse
 import base64
+import contextlib
 import gzip
 import hashlib
 import http.client as http_client
@@ -288,7 +289,8 @@ def fetch(number=None, variant=None, keep=False):
     if not name:
         variants = sorted({m.group(1) for p in files if (m := re.fullmatch(r"debian-\d+-(.+)-\d+\.img\.zst", p))})
         raise Fail(f"build {number} has no '{variant}' image; available: {', '.join(variants)}")
-    free = shutil.disk_usage(DATA if DATA.exists() else DATA.parent).free
+    DATA.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(DATA).free
     if free < 10e9:
         raise Fail(f"only {free / 1e9:.1f} GB free; about 10 GB are needed while setting up")
     build_dir.mkdir(parents=True, exist_ok=True)
@@ -445,6 +447,38 @@ def all_instances():
     return [Instance(p.name) for p in sorted(INSTANCES.glob("*")) if (p / "instance.json").exists()]
 
 
+class Device(Instance):
+    """A real Flipper One on the network, for the commands that only need its web page or its SSH.
+
+    The remote view of the real device is the same web server the emulated one
+    runs, so pressing buttons, the panel and the App Manager work unchanged.
+    """
+    def __init__(self, address):
+        self.host, _, port = address.partition(":")
+        self.port = int(port or 8899)
+        self.name = address
+
+    state = {}
+
+    def running(self):
+        return True
+
+    def url(self, path=""):
+        return f"http://{self.host}:{self.port}/{path}"
+
+    def qmp(self, command, _timeout=10, **arguments):
+        raise Fail("that needs the emulator; a real device has no QEMU to ask")
+
+    def ssh_base(self, tool="ssh", root=False):
+        # The owner's own SSH setup: their keys, their known hosts.
+        return [tool, "-o", "ConnectTimeout=10"], f"{'root' if root else 'user'}@{self.host}"
+
+
+def subject(a):
+    """What a command is about: an instance, or with --device a real Flipper One."""
+    return Device(a.device) if getattr(a, "device", None) else Instance(a.name)
+
+
 def free_port(host, wanted, taken=()):
     for port in range(wanted, wanted + 200):
         if port in taken:
@@ -485,12 +519,22 @@ def credentials(pubkey):
     compositor apps are drawn in. Dropping the seat gets a plain session; the
     rest selects software rendering, as there is no GPU either.
 
+    A session without a seat is not a local one to polkit, which then refuses
+    flipctl the network settings: joining Wi-Fi from the device's menu fails
+    with "Not authorized to control networking". The rule gives that back. It
+    lives in /run, and is written before polkit starts, which is the only time
+    polkit looks there.
+
     On the kernel command line because this kernel has neither dmi-sysfs nor
     fw_cfg, the two channels systemd reads QEMU-supplied credentials from.
     """
+    rule = ('polkit.addRule(function(action, subject) { if (subject.user == "user" && '
+            'action.id.indexOf("org.freedesktop.NetworkManager.") == 0) return polkit.Result.YES; });')
     tmpfiles = (
         "d /home/user/.ssh 0700 user user -\n"
         f"f /home/user/.ssh/authorized_keys 0600 user user - {pubkey}\n"
+        "d /run/polkit-1/rules.d 0755 root root -\n"
+        f"f /run/polkit-1/rules.d/49-f1emu.rules 0644 root root - {rule}\n"
     )
     creds = {
         "ssh.authorized_keys.root": pubkey.encode(),
@@ -661,7 +705,7 @@ def cmd_start(a):
     if inst.running():
         say(f"Instance '{inst.name}' is already running at {inst.view_url()}")
         open_view(inst, a.open or conf["open"])
-        return
+        return {"name": inst.name, "url": inst.view_url(), "ssh_port": inst.state["ssh_port"], "already_running": True}
     need("qemu-system-aarch64", "qemu-img", "ssh-keygen")
     firmware_args()
     state = inst.state
@@ -753,6 +797,8 @@ def cmd_start(a):
     if opts["port"] != (a.port or conf["port"]):
         warn(f"port {a.port or conf['port']} was busy, using {opts['port']}")
     open_view(inst, a.open or conf["open"])
+    return {"name": inst.name, "url": inst.view_url(), "ssh_port": opts["ssh_port"], "build": meta["name"],
+            "profile": entry["profile"], "kernel": entry["version"], "boot_seconds": round(took)}
 
 
 def cmd_stop(a):
@@ -796,15 +842,20 @@ def cmd_status(a):
     instances = all_instances()
     if not instances:
         print("No instances yet. Run `f1emu start`.")
-        return
+    listed = []
     for inst in instances:
         s = inst.state
-        line = f"{inst.name:12} {'running' if inst.running() else 'stopped':8} build {s['build']:6} {s['profile']:12}"
-        if inst.running():
+        up = inst.running()
+        line = f"{inst.name:12} {'running' if up else 'stopped':8} build {s['build']:6} {s['profile']:12}"
+        if up:
             line += f" {inst.view_url()}  ssh :{s['ssh_port']}" + ("  (ephemeral)" if s.get("ephemeral") else "")
         elif inst.disk.exists():
             line += f" disk {inst.disk.stat().st_size / 1e6:.0f} MB of changes"
         print(line)
+        listed.append({"name": inst.name, "running": up, "build": s["build"], "profile": s["profile"],
+                       "url": inst.view_url() if up else None, "ssh_port": s["ssh_port"] if up else None,
+                       "ephemeral": bool(s.get("ephemeral"))})
+    return listed
 
 
 def cmd_open(a):
@@ -812,13 +863,14 @@ def cmd_open(a):
     inst.require_running()
     open_view(inst, a.how)
     print(inst.view_url())
+    return {"url": inst.view_url()}
 
 
 def cmd_ssh(a):
-    inst = Instance(a.name)
+    inst = subject(a)
     inst.require_running()
-    base, target = inst.ssh_base(root=a.root)
-    os.execvp("ssh", base + [target] + a.command)
+    base, where = inst.ssh_base(root=a.root)
+    os.execvp("ssh", base + [where] + a.command)
 
 
 def cmd_copy(a):
@@ -833,14 +885,18 @@ def cmd_copy(a):
     run(base + ["-r", *args], capture_output=False)
 
 
-def cmd_press(a):
-    inst = Instance(a.name)
-    inst.require_running()
-    for key in a.keys:
+def press(inst, keys, hold=0.08, gap=0.15):
+    for key in keys:
         http(inst.url("input"), {"key": key, "down": True})
-        time.sleep(a.hold)
+        time.sleep(hold)
         http(inst.url("input"), {"key": key, "down": False})
-        time.sleep(a.gap)
+        time.sleep(gap)
+
+
+def cmd_press(a):
+    inst = subject(a)
+    inst.require_running()
+    press(inst, a.keys, a.hold, a.gap)
 
 
 def read_panel(inst, wait=3.0):
@@ -919,7 +975,7 @@ def video_on(inst):
 
 
 def cmd_screenshot(a):
-    inst = Instance(a.name)
+    inst = subject(a)
     inst.require_running()
     if a.video:
         picture = video_png(inst)
@@ -932,10 +988,11 @@ def cmd_screenshot(a):
         picture = panel_png(inst, a.scale, a.grey)
     Path(a.path).write_bytes(picture)
     say(f"Saved {a.path}")
+    return {"path": os.path.abspath(a.path)}
 
 
 def cmd_apps(a):
-    inst = Instance(a.name)
+    inst = subject(a)
     inst.require_running()
     apps = json.loads(http(inst.url("apps.json")))
     if apps.get("error"):
@@ -946,7 +1003,7 @@ def cmd_apps(a):
         for app in apps["offered"]:
             if not app["installed"]:
                 print(f"available  {app['name']:28} {app['size']:>8}  {app['folder']}")
-        return
+        return apps
     if a.action == "add":
         if not os.path.isfile(a.app):
             raise Fail(f"{a.app} is not a file")
@@ -1054,7 +1111,7 @@ def cmd_snapshot(a):
     if a.action == "list":
         listed = inst.hmp("info snapshots") if live else run(["qemu-img", "snapshot", "-l", inst.disk]).stdout
         print(listed.strip() or "no snapshots")
-        return
+        return {"snapshots": snapshots(inst)}
     if not re.fullmatch(r"[\w.-]{1,40}", a.tag):
         raise Fail("snapshot names are up to 40 letters, digits, '_', '.' and '-'")
     if not live:
@@ -1080,23 +1137,29 @@ def cmd_snapshot(a):
 def cmd_builds(a):
     if a.remote:
         local = {b["name"] for b in local_builds()}
-        for number, name, mtime in remote_builds(a.branches)[-a.count:]:
+        remote = remote_builds(a.branches)[-a.count:]
+        for number, name, mtime in remote:
             print(f"{name:40} {mtime[:16].replace('T', ' ')}{'  (downloaded)' if name in local else ''}")
-        return
+        return [{"name": name, "published": mtime, "downloaded": name in local} for number, name, mtime in remote]
     used = {(i.state["build"], i.state["variant"]): i.name for i in all_instances()}
+    listed = []
     for b in local_builds():
         size = sum(f.stat().st_blocks * 512 for f in Path(b["dir"]).rglob("*") if f.is_file())
         profiles = sorted({e["profile"] for e in b["entries"] if e["bootable"]})
         owner = used.get((b["name"], b["variant"]))
         print(f"{b['name']:8} {b['variant']:14} {size / 1e9:4.1f} GB  built {b['built'][:10]}  "
               f"profiles: {', '.join(profiles)}{'  used by ' + owner if owner else ''}")
-    if not local_builds():
+        listed.append({"name": b["name"], "variant": b["variant"], "bytes": size, "built": b["built"],
+                       "profiles": profiles, "used_by": owner})
+    if not listed:
         print("Nothing downloaded yet. `f1emu fetch` gets the newest build.")
+    return listed
 
 
 def cmd_fetch(a):
     meta = fetch(a.build, a.variant, a.keep_download)
     say(f"Build {meta['name']} ({meta['variant']}) is ready in {meta['dir']}")
+    return {"name": meta["name"], "variant": meta["variant"], "dir": meta["dir"]}
 
 
 def cmd_profiles(a):
@@ -1105,6 +1168,7 @@ def cmd_profiles(a):
         raise Fail("that build is not downloaded; see `f1emu builds`")
     for e in builds[-1]["entries"]:
         print(f"{e['profile']:14} kernel {e['version']:28} {'' if e['bootable'] else 'cannot boot in QEMU (no virtio)'}")
+    return builds[-1]["entries"]
 
 
 def cmd_rm_build(a):
@@ -1134,6 +1198,7 @@ def cmd_doctor(a):
     print(f"ok  {'data directory':22} {DATA} ({shutil.disk_usage(DATA).free / 1e9:.0f} GB free)")
     if not ok:
         raise Fail("some requirements are missing")
+    return {"tools": {tool: shutil.which(tool) for tool in TOOLS}, "firmware": firmware, "kvm": kvm, "data": str(DATA)}
 
 
 def cmd_desktop(a):
@@ -1193,6 +1258,7 @@ echo voltage=$(cat $p/battery_voltage 2>/dev/null)
 echo video=$(test -e /dev/dri/card0 && echo 1)
 echo cable=$(cat /run/f1emu/cable 2>/dev/null)
 echo signal=$(cat /run/f1emu/modem/signal 2>/dev/null)
+echo speed=$(cat /run/f1emu/battery_speed 2>/dev/null)
 echo online=$(/usr/bin/nmcli -t -f CONNECTIVITY general 2>/dev/null)
 echo mods=$(lsmod | grep -oE '^(mac80211_hwsim|test_power|wwan_hwsim)' | tr '\n' ,)
 echo operator=$(cat /run/f1emu/modem/operator 2>/dev/null)
@@ -1248,6 +1314,13 @@ def sim_modules(inst):
     return out
 
 
+def battery_clock(speed):
+    """Shell for the guest: let the battery empty and fill this many times faster than a real one, 0 not at all."""
+    return ("{ kill $(cat /run/f1emu/battery.pid 2>/dev/null) 2>/dev/null; rm -f /run/f1emu/battery.pid; "
+            f"echo {speed} > /run/f1emu/battery_speed; "
+            + (f"(setsid sh /run/f1emu/battery.sh {speed} >/dev/null 2>&1 &); " if speed else "") + "}")
+
+
 def sim_on(inst, kinds):
     """Load pretend hardware into a running guest. It lasts until the guest stops.
 
@@ -1264,7 +1337,7 @@ def sim_on(inst, kinds):
              "mkdir -p /run/f1emu/bin /run/f1emu/modem /run/f1emu/shims", root=True)
     scp, target = inst.ssh_base("scp", root=True)
     run(scp + [*(modules / f"{m}.ko" for m in SIM_MODULES.values()),
-               SIM_DIR / "wifi.sh", SIM_DIR / "laptop.sh", SIM_DIR / "usbpc.sh",
+               *(SIM_DIR / f"{name}.sh" for name in ("wifi", "laptop", "usbpc", "battery", "cell")),
                f"{target}:/run/f1emu/"])
     run(scp + [*(SIM_DIR / name for name in ("mmcli", "qmicli", "nmcli")), f"{target}:/run/f1emu/shims/"])
     steps, restart = [], False
@@ -1275,10 +1348,12 @@ def sim_on(inst, kinds):
     if "battery" in kinds and "test_power" not in loaded:
         steps.append("insmod /run/f1emu/test_power.ko battery_voltage=7700000 battery_current=-125000 && "
                      "echo discharging > /sys/module/test_power/parameters/battery_status && "
-                     "echo off > /sys/module/test_power/parameters/ac_online && echo none > /run/f1emu/cable")
+                     "echo off > /sys/module/test_power/parameters/ac_online && echo none > /run/f1emu/cable && "
+                     "echo -125000 > /run/f1emu/cable_current && " + battery_clock(1))
         restart = True
     if "modem" in kinds and "wwan_hwsim" not in loaded:
-        steps.append("modprobe wwan && insmod /run/f1emu/wwan_hwsim.ko devices=1 && cp /run/f1emu/shims/* /run/f1emu/bin/")
+        steps.append("modprobe wwan && insmod /run/f1emu/wwan_hwsim.ko devices=1 && cp /run/f1emu/shims/* /run/f1emu/bin/ && "
+                     "sh /run/f1emu/cell.sh up")
         restart = True
     if "laptop" in kinds:
         steps.append("{ ip netns list | grep -q '^laptop' || sh /run/f1emu/laptop.sh up; }")
@@ -1322,6 +1397,8 @@ def sim_state(inst):
         "level": int(raw["level"]) if raw["level"] else None,
         "cable": raw["cable"] or "none",
         "signal": int(raw["signal"] or 74),
+        # How many times faster than a real one the battery empties and fills; 0 is not at all.
+        "speed": int(raw["speed"] or 0),
         "video": raw["video"] == "1",
         "operator": raw["operator"] or "Test Network",
         "tech": raw["tech"] or "5gnr",
@@ -1375,8 +1452,12 @@ def cmd_sim(a):
         if a.charging or a.discharging:
             sets.append(f"echo {'on' if a.charging else 'off'} > ac_online")
             sets.append(f"echo {'charging' if a.charging else 'discharging'} > battery_status")
+        if a.speed is not None:
+            if not 0 <= a.speed <= 3600:
+                raise Fail("the speed is a number from 0 (the level stays put) to 3600")
+            sets.append(battery_clock(a.speed))
         if not sets:
-            raise Fail("give a level, --charging or --discharging")
+            raise Fail("give a level, --speed, --charging or --discharging")
         done = inst.ssh("cd /sys/module/test_power/parameters && " + " && ".join(sets), root=True, check=False)
         if done.returncode:
             raise Fail("the simulated battery is not loaded; run `f1emu sim on battery`")
@@ -1387,7 +1468,7 @@ def cmd_sim(a):
         mains, usb, status, current = USB_STATES[first]
         done = inst.ssh(f"cd /sys/module/test_power/parameters && echo {mains} > ac_online && echo {usb} > usb_online && "
                         f"echo {status} > battery_status && echo {current} > battery_current && "
-                        f"echo {first} > /run/f1emu/cable && "
+                        f"echo {first} > /run/f1emu/cable && echo {current} > /run/f1emu/cable_current && "
                         f"sh /run/f1emu/usbpc.sh {'up' if first == 'laptop' else 'down'} 2>&1",
                         root=True, timeout=60, check=False)
         if done.returncode:
@@ -1438,9 +1519,10 @@ def cmd_sim(a):
         if "wifi" in on:
             print(inst.ssh("/usr/bin/nmcli -t -f SSID,SIGNAL,SECURITY device wifi list | sed 's/^/           /'",
                            root=True).stdout.rstrip())
-        print(f"battery  {'on, %d%%, USB-C: %s' % (state['level'], state['cable']) if 'battery' in on else 'off'}")
+        print(f"battery  {'on, %d%%, USB-C: %s, time x%d' % (state['level'], state['cable'], state['speed']) if 'battery' in on else 'off'}")
         print(f"modem    {'on, %s, %s, signal %d%%' % (state['operator'], state['tech'], state['signal']) if 'modem' in on else 'off'}")
         print(f"laptop   {'plugged into ETH1, ' + (state['laptops']['eth1'] or 'no address yet') if 'laptop' in on else 'off'}")
+        return state
 
 
 # What the page may ask `f1emu sim` for.
@@ -1599,16 +1681,322 @@ def cmd_viewer(a):
         server.handle_request()
 
 
+# ---------- automation ----------
+
+def flipctl_log(inst, lines=400):
+    # By its name in the log, not by its unit: it runs in a login session.
+    return inst.ssh(f"sudo -n journalctl -b -t flipctl -o cat --no-pager -n {lines}").stdout.splitlines()
+
+
+def screen_info(inst):
+    """What the device shows, as far as flipctl says so in its own log.
+
+    That is the name of the screen, the last menu entry opened and the app in
+    front. flipctl does not log the words it draws.
+    """
+    info = {"screen": None, "menu": None, "app": None, "switcher": None, "stack": None, "status": None}
+    pid = None
+    for line in flipctl_log(inst):
+        if m := re.match(r"\s*handled on\s+screen=(\S+) switcher=(\S+) stack=(\d+)", line):
+            info.update(screen=m[1].lower(), switcher=m[2], stack=int(m[3]))
+        elif m := re.match(r"screen\s+(.+)", line):
+            info["screen"] = m[1].strip().lower()
+        elif m := re.match(r"menu\s+(.+)", line):
+            info["menu"] = m[1].strip()
+        elif m := re.match(r"app\s+(.+) placed on \S+ \(pid (\d+)\)", line):
+            info["app"], pid = m[1], m[2]
+        elif m := re.match(r"status\s+(.+)", line):
+            info["status"] = m[1].strip()
+    # The log says when an app came up, not when it went away.
+    if pid and inst.ssh(f"test -d /proc/{pid}", check=False).returncode:
+        info["app"] = None
+    return info
+
+
+def cmd_screen(a):
+    inst = subject(a)
+    inst.require_running()
+    info = screen_info(inst)
+    for key, value in info.items():
+        print(f"{key:9} {'-' if value is None else value}")
+    return info
+
+
+def wait_for(inst, what, value=None, timeout=30):
+    """Block until the panel's picture changes, a screen is shown or an app is in front."""
+    started = time.monotonic()
+    if what == "app" and not value:
+        raise Fail("say which app to wait for")
+    if what == "screen" and not value:
+        before = read_panel(inst)
+        reached = lambda: read_panel(inst) != before
+    elif what == "screen":
+        reached = lambda: screen_info(inst)["screen"] == value.lower()
+    else:
+        reached = lambda: value.lower() in (screen_info(inst)["app"] or "").lower()
+    while not reached():
+        if time.monotonic() - started > timeout:
+            raise Fail(f"waited {timeout} s for " + (f"{what} '{value}'" if value else "the screen to change"))
+        time.sleep(0.3)
+    return round(time.monotonic() - started, 1)
+
+
+def cmd_wait(a):
+    inst = subject(a)
+    inst.require_running()
+    waited = wait_for(inst, a.what, a.value, a.timeout)
+    say(f"There after {waited} s")
+    return {"ok": True, "waited": waited}
+
+
+def cmd_test(a):
+    """One throwaway run: boot, put apps in, press keys, keep the screen and the log, delete the instance."""
+    source = Instance(a.name)
+    state = source.state
+    inst = Instance(f"test-{os.getpid()}")
+    out = Path(a.out or f"f1emu-test-{time.strftime('%Y%m%d-%H%M%S')}")
+    me = [sys.executable, os.path.abspath(__file__)]
+    start = ["start", "-n", inst.name, "--ephemeral", "--open", "none", "--no-audio",
+             *(["--sim", a.sim] if a.sim else ["--no-sim"])]
+    if state:
+        start += ["--build", state["build"], "--variant", state["variant"], "--profile", state["profile"]]
+    if a.snapshot:
+        if not state or a.snapshot not in snapshots(source):
+            raise Fail(f"instance '{source.name}' has no snapshot '{a.snapshot}'")
+        if state.get("ephemeral") and source.running():
+            raise Fail("the snapshots of an ephemeral instance exist only inside its running emulator; "
+                       "take the snapshot in an instance started without --ephemeral")
+        need("qemu-img")
+    info = {}
+    try:
+        if a.snapshot:
+            inst.dir.mkdir(parents=True)
+            # The disk as it was in the snapshot, as a new disk on top of the same
+            # image. A snapshot of a running instance holds its memory too; that
+            # stays behind, so this boots as after a power cut at that moment.
+            run(["qemu-img", "convert", "-U", "-O", "qcow2", "-B", BUILDS / f"{state['build']}-{state['variant']}" / "root.btrfs",
+                 "-F", "raw", "-l", f"snapshot.name={a.snapshot}", source.disk, inst.disk])
+        # Its progress is for people: never onto the stdout a --json caller reads.
+        run(me + start, capture_output=False, stdout=sys.stderr)
+        for app in a.app:
+            run(me + ["apps", "-n", inst.name, "add", app])
+        if a.run:
+            run(me + ["apps", "-n", inst.name, "run", a.run])
+            wait_for(inst, "app", a.run, a.timeout)
+        press(inst, a.keys, gap=a.gap)
+        time.sleep(a.settle)
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "screen.png").write_bytes(panel_png(inst))
+        info = screen_info(inst)
+        (out / "screen.json").write_text(json.dumps(info, indent=1) + "\n")
+        (out / "flipctl.log").write_text("\n".join(flipctl_log(inst, 5000)) + "\n")
+    finally:
+        run(me + ["stop", "-n", inst.name, "--force"], check=False)
+        shutil.rmtree(inst.dir, ignore_errors=True)
+    say(f"The screen and the log are in {out}")
+    return {"out": str(out.resolve()), **info}
+
+
+def cmd_upgrade(a):
+    """Move an instance to another build, carrying ~/Files and ~/Apps across.
+
+    Everything else is the OS and goes with the old build. Apps are files in
+    ~/Apps, their runtimes included, so they come along as they are.
+    """
+    inst = Instance(a.name)
+    state = inst.state
+    if not state:
+        raise Fail(f"there is no instance '{inst.name}'")
+    if state.get("ephemeral"):
+        raise Fail("an ephemeral instance keeps nothing; start a new one with --build instead")
+    meta = fetch(a.build, state["variant"])
+    if meta["name"] == state["build"]:
+        raise Fail(f"instance '{inst.name}' is already on build {meta['name']}")
+    me = [sys.executable, os.path.abspath(__file__)]
+    if not inst.running():
+        run(me + ["start", "-n", inst.name, "--open", "none", "--no-audio", "--no-sim"], capture_output=False, stdout=sys.stderr)
+    # Next to the instance, not inside: its directory is about to be deleted.
+    kept = INSTANCES / f"{inst.name}.kept.tar"
+    base, where = inst.ssh_base()
+    say("Copying ~/Files and ~/Apps out")
+    with open(kept, "wb") as tar:
+        saved = subprocess.run(base + [where, "cd ~ && tar -cf - $(ls -d Files Apps 2>/dev/null)"], stdout=tar, stderr=subprocess.PIPE)
+    if saved.returncode:
+        kept.unlink()
+        raise Fail(f"could not copy the files out, nothing was changed: {saved.stderr.decode().strip()[-300:]}")
+    # The options of the last start, with the new build in place of the old one.
+    args = state.get("start_args", ["-n", inst.name])
+    args = [x for i, x in enumerate(args) if x != "--build" and (i == 0 or args[i - 1] != "--build")]
+    run(me + ["stop", "-n", inst.name], capture_output=False, stdout=sys.stderr)
+    old = inst.dir.with_name(inst.name + ".old")
+    inst.dir.rename(old)
+    try:
+        run(me + ["start", *args, "--build", meta["name"], "--open", "none"], capture_output=False, stdout=sys.stderr)
+        with open(kept, "rb") as tar:
+            # The new start may have been given another SSH port.
+            restored = subprocess.run(Instance(inst.name).ssh_base()[0] + [where, "tar -C ~ -xf -"],
+                                      stdin=tar, stderr=subprocess.PIPE)
+        if restored.returncode:
+            raise Fail(f"the new build is up, but the files did not go in: {restored.stderr.decode().strip()[-300:]}. "
+                       f"They are in {kept}")
+        # flipctl lists the apps it finds when it starts.
+        Instance(inst.name).ssh("sudo -n systemctl restart flipctl", check=False)
+    except Fail:
+        say(f"The old instance is kept in {old}")
+        raise
+    shutil.rmtree(old)
+    kept.unlink()
+    say(f"Instance '{inst.name}' is on build {meta['name']}, with its files and apps")
+    return {"name": inst.name, "build": meta["name"], "was": state["build"]}
+
+
+def cmd_completion(a):
+    """Print a shell completion script, written from the commands and options defined below."""
+    commands = {name: sp for name, sp in a.sub.choices.items() if not name.startswith("_")}
+    about = {c.dest: c.help or "" for c in a.sub._choices_actions}
+    words = {}
+    for name, sp in commands.items():
+        flags = [o for act in sp._actions for o in act.option_strings if o.startswith("--")]
+        values = [str(c) for act in sp._actions if not act.option_strings and act.choices for c in act.choices]
+        words[name] = (flags, values)
+    if a.shell == "fish":
+        print("# f1emu completion for fish: f1emu completion fish > ~/.config/fish/completions/f1emu.fish")
+        for name in commands:
+            text = about.get(name, "").replace("\\", "\\\\").replace("'", "\\'")
+            print(f"complete -c f1emu -n __fish_use_subcommand -f -a {name} -d '{text}'")
+            flags, values = words[name]
+            for flag in flags:
+                print(f"complete -c f1emu -n '__fish_seen_subcommand_from {name}' -l {flag[2:]}")
+            if values:
+                print(f"complete -c f1emu -n '__fish_seen_subcommand_from {name}' -f -a '{' '.join(values)}'")
+        return
+    if a.shell == "zsh":
+        print("# f1emu completion for zsh: eval \"$(f1emu completion zsh)\" in ~/.zshrc")
+        print("autoload -U +X compinit && compinit\nautoload -U +X bashcompinit && bashcompinit")
+    else:
+        print("# f1emu completion for bash: eval \"$(f1emu completion bash)\" in ~/.bashrc")
+    print("_f1emu() {\n  local cur=${COMP_WORDS[COMP_CWORD]} words\n  if [ \"$COMP_CWORD\" -eq 1 ]; then\n"
+          f"    words=\"{' '.join(commands)}\"\n  else\n    case \"${{COMP_WORDS[1]}}\" in")
+    for name, (flags, values) in words.items():
+        print(f"      {name}) words=\"{' '.join(flags + values)}\";;")
+    print("    esac\n  fi\n  COMPREPLY=($(compgen -W \"$words\" -- \"$cur\"))\n}\ncomplete -o default -F _f1emu f1emu")
+
+
+def mcp_tools():
+    """The commands offered to an AI agent: name -> (what it does, its arguments, required ones, the command line)."""
+    name = {"name": {"type": "string", "description": "instance name (default: default)"}}
+    n = lambda p: ["-n", p.get("name", "default")]
+    text = lambda about: {"type": "string", "description": about}
+    return {
+        "status": ("List the emulator's instances and whether they run.", {}, [], lambda p: ["status"]),
+        "start": ("Boot Flipper OS in an instance. Takes about 20 seconds.",
+                  name | {"sim": text("pretend hardware to load: all, or a comma list of wifi,battery,modem,laptop,video"),
+                          "ephemeral": {"type": "boolean", "description": "throw away all changes when it stops"}}, [],
+                  lambda p: ["start", *n(p), "--open", "none", *(["--sim", p["sim"]] if p.get("sim") else []),
+                             *(["--ephemeral"] if p.get("ephemeral") else [])]),
+        "stop": ("Shut an instance down.", name, [], lambda p: ["stop", *n(p)]),
+        "press": ("Press buttons of the device, in order. From the idle screen `view` opens the menu.",
+                  name | {"keys": {"type": "array", "items": {"type": "string", "enum": list(KEYS)}}}, ["keys"],
+                  lambda p: ["press", *n(p), *p["keys"]]),
+        "screen": ("What the device shows, as text: the screen's name, the last menu entry opened, the app in front. "
+                   "Not the words on the panel; use screenshot for those.", name, [], lambda p: ["screen", *n(p)]),
+        "screenshot": ("The device's 256x144 panel as a picture.", name, [], None),
+        "wait": ("Wait until the panel changes (what=screen), a named screen is shown (what=screen, value=menu) "
+                 "or an app is in front (what=app, value=its name).",
+                 name | {"what": {"type": "string", "enum": ["screen", "app"]}, "value": text("screen or app name"),
+                         "timeout": {"type": "number", "description": "seconds (default 30)"}}, ["what"],
+                 lambda p: ["wait", *n(p), p["what"], *([p["value"]] if p.get("value") else []),
+                            "--timeout", str(p.get("timeout", 30))]),
+        "apps": ("The device's App Manager: list, install, run or remove an app, or add an app file from this PC.",
+                 name | {"action": {"type": "string", "enum": ["list", "install", "run", "remove", "add"]},
+                         "app": text("app name, or for add the path of a .fap.py or .fap.AppImage file")}, ["action"],
+                 lambda p: ["apps", *n(p), p["action"], *([p["app"]] if p.get("app") else [])]),
+        "sim": ("Pretend hardware. action=status reports it; others set it, e.g. action=battery args=[\"20\"], "
+                "action=usb args=[\"charger\"], action=modem args=[\"--signal\",\"40\"], action=laptop args=[\"on\"].",
+                name | {"action": {"type": "string", "enum": ["on", "battery", "usb", "modem", "laptop", "status"]},
+                        "args": {"type": "array", "items": {"type": "string"}}}, ["action"],
+                lambda p: ["sim", *n(p), p["action"], *map(str, p.get("args", []))]),
+        "shell": ("Run a shell command inside the guest and return what it printed.",
+                  name | {"command": text("the command"), "root": {"type": "boolean", "description": "run as root"}},
+                  ["command"], lambda p: ["ssh", *n(p), *(["--root"] if p.get("root") else []), "--", p["command"]]),
+        "test": ("One throwaway run: boot a fresh instance, add and run an app, press keys, then return the screen "
+                 "and the directory holding screen.png, screen.json and flipctl.log.",
+                 name | {"snapshot": text("start from this snapshot of the instance"), "app": text("app file to add"),
+                         "run": text("name of the app to start"),
+                         "keys": {"type": "array", "items": {"type": "string", "enum": list(KEYS)}}}, [],
+                 lambda p: ["test", *n(p), *(["--snapshot", p["snapshot"]] if p.get("snapshot") else []),
+                            *(["--app", p["app"]] if p.get("app") else []), *(["--run", p["run"]] if p.get("run") else []),
+                            *(["--keys", *p["keys"]] if p.get("keys") else [])]),
+    }
+
+
+def cmd_mcp(a):
+    """A Model Context Protocol server on stdin and stdout: the commands above as tools for an AI agent."""
+    me = [sys.executable, os.path.abspath(__file__)]
+    tools = mcp_tools()
+
+    def call(name, given):
+        about, props, required, argv = tools[name]
+        if name == "screenshot":
+            with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+                done = subprocess.run(me + ["screenshot", "-n", given.get("name", "default"), tmp.name],
+                                      capture_output=True, text=True, stdin=subprocess.DEVNULL)
+                if done.returncode == 0:
+                    picture = base64.b64encode(Path(tmp.name).read_bytes()).decode()
+                    return {"content": [{"type": "image", "data": picture, "mimeType": "image/png"}]}
+        else:
+            command = argv(given)
+            # `ssh` hands over to the real ssh, which knows nothing of --json.
+            command = command if name == "shell" else [command[0], "--json", *command[1:]]
+            done = subprocess.run(me + command, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=3600)
+        said = done.stdout.strip() or done.stderr.strip()
+        return {"content": [{"type": "text", "text": said}], "isError": done.returncode != 0}
+
+    for line in sys.stdin:
+        try:
+            ask = json.loads(line)
+        except ValueError:
+            continue
+        method, params = ask.get("method"), ask.get("params") or {}
+        if "id" not in ask:
+            continue                    # a notification: nothing to answer
+        answer = {"jsonrpc": "2.0", "id": ask["id"]}
+        try:
+            if method == "initialize":
+                answer["result"] = {"protocolVersion": params.get("protocolVersion", "2024-11-05"),
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": "f1emu", "version": VERSION}}
+            elif method == "ping":
+                answer["result"] = {}
+            elif method == "tools/list":
+                answer["result"] = {"tools": [
+                    {"name": name, "description": about,
+                     "inputSchema": {"type": "object", "properties": props, "required": required}}
+                    for name, (about, props, required, argv) in tools.items()]}
+            elif method == "tools/call" and params.get("name") in tools:
+                answer["result"] = call(params["name"], params.get("arguments") or {})
+            else:
+                answer["error"] = {"code": -32601, "message": f"unknown method or tool: {method}"}
+        except (KeyError, TypeError, subprocess.TimeoutExpired) as e:
+            answer["error"] = {"code": -32602, "message": f"bad arguments: {e}"}
+        sys.stdout.write(json.dumps(answer) + "\n")
+        sys.stdout.flush()
+
+
 def main():
     p = argparse.ArgumentParser(prog="f1emu", description="Run the real Flipper One OS in QEMU on Linux.")
     p.add_argument("--version", action="version", version=VERSION)
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
-    def add(name, fn, text, instance=True):
+    def add(name, fn, text, instance=True, device=False):
         sp = sub.add_parser(name, help=text, description=text)
         sp.set_defaults(fn=fn)
         if instance:
             sp.add_argument("-n", "--name", default="default", help="instance name (default: default)")
+        if device:
+            sp.add_argument("--device", metavar="ADDRESS", help="talk to a real Flipper One at this address "
+                            "instead of an instance (untested on real hardware)")
+        sp.add_argument("--json", action="store_true", help="print the result as JSON; progress goes to stderr")
         return sp
 
     s = add("start", cmd_start, "boot Flipper OS (downloads the newest build on first use)")
@@ -1646,7 +2034,7 @@ def main():
     s = add("open", cmd_open, "open the remote view of a running instance")
     s.add_argument("how", nargs="?", default="browser", choices=("browser", "app", "none"))
 
-    s = add("ssh", cmd_ssh, "open a shell in the guest, or run a command there")
+    s = add("ssh", cmd_ssh, "open a shell in the guest, or run a command there", device=True)
     s.add_argument("--root", action="store_true", help="log in as root instead of user")
     s.add_argument("command", nargs=argparse.REMAINDER)
 
@@ -1656,19 +2044,19 @@ def main():
         s.add_argument("--root", action="store_true")
         s.add_argument("paths", nargs="+", metavar="PATH", help="sources, then an optional destination")
 
-    s = add("press", cmd_press, "press device buttons: " + " ".join(KEYS))
+    s = add("press", cmd_press, "press device buttons: " + " ".join(KEYS), device=True)
     s.add_argument("keys", nargs="+", choices=KEYS, metavar="KEY")
     s.add_argument("--hold", type=float, default=0.08, help="seconds each key is held (default: 0.08)")
     s.add_argument("--gap", type=float, default=0.15, help="seconds between keys (default: 0.15)")
 
-    s = add("screenshot", cmd_screenshot, "save the panel as a PNG")
+    s = add("screenshot", cmd_screenshot, "save the panel as a PNG", device=True)
     s.add_argument("path")
     s.add_argument("--scale", type=int, default=4, help="integer upscale (default: 4)")
     s.add_argument("--grey", action="store_true", help="raw greyscale instead of the amber backlight")
     s.add_argument("--vt", action="store_true", help="capture the boot console instead of the panel")
     s.add_argument("--video", action="store_true", help="capture the video output instead of the panel")
 
-    s = add("apps", cmd_apps, "list, install, run or remove Flipper apps; `add` copies in your own app file")
+    s = add("apps", cmd_apps, "list, install, run or remove Flipper apps; `add` copies in your own app file", device=True)
     s.add_argument("action", choices=("list", "install", "run", "remove", "add"))
     s.add_argument("app", nargs="?", help="app name or a unique part of it; for `add`, a .AppImage or .fap.py file")
 
@@ -1689,6 +2077,8 @@ def main():
                    "pcap: file to save")
     s.add_argument("--charging", action="store_true", help="battery: plugged in")
     s.add_argument("--discharging", action="store_true", help="battery: on battery power")
+    s.add_argument("--speed", type=int, metavar="N", help="battery: empty and fill N times faster than a real one "
+                   "(default 1; 0 keeps the level where it is set)")
     s.add_argument("--signal", type=int, help="modem: signal quality 0-100")
     s.add_argument("--operator", help="modem: network name")
     s.add_argument("--tech", choices=("lte", "5gnr"), help="modem: access technology")
@@ -1735,7 +2125,34 @@ def main():
     s = add("purge", cmd_purge, "delete all builds, instances and keys", instance=False)
     s.add_argument("-y", "--yes", action="store_true")
 
-    sub.add_parser("_viewer").set_defaults(fn=cmd_viewer, name="default")
+    add("screen", cmd_screen, "what the device shows, as text: the screen's name, the menu entry opened, the app in front",
+        device=True)
+
+    s = add("wait", cmd_wait, "wait until the panel changes, a screen is shown or an app is in front", device=True)
+    s.add_argument("what", choices=("screen", "app"))
+    s.add_argument("value", nargs="?", help="screen: its name, e.g. menu (default: any change); app: its name or a part")
+    s.add_argument("--timeout", type=float, default=30, help="seconds to wait before failing (default: 30)")
+
+    s = add("test", cmd_test, "one throwaway run: boot, add apps, press keys, keep the screen and the log")
+    s.add_argument("--snapshot", metavar="TAG", help="start from this snapshot of the instance named with -n")
+    s.add_argument("--app", action="append", default=[], metavar="FILE", help="app file to copy in (repeatable)")
+    s.add_argument("--run", metavar="APP", help="app to start, and wait for, before the keys")
+    s.add_argument("--keys", nargs="*", default=[], choices=KEYS, metavar="KEY", help="buttons to press")
+    s.add_argument("--gap", type=float, default=0.4, help="seconds between keys (default: 0.4)")
+    s.add_argument("--settle", type=float, default=2, help="seconds to let the screen settle before it is kept (default: 2)")
+    s.add_argument("--timeout", type=float, default=60, help="seconds to wait for the app (default: 60)")
+    s.add_argument("--sim", metavar="KINDS", help="pretend hardware to load, as for start")
+    s.add_argument("--out", metavar="DIR", help="where to keep the results (default: f1emu-test-DATE)")
+
+    add("mcp", cmd_mcp, "serve these commands to an AI agent (Model Context Protocol, on stdin and stdout)", instance=False)
+
+    s = add("upgrade", cmd_upgrade, "move an instance to another build, keeping ~/Files and ~/Apps")
+    s.add_argument("build", nargs="?", help="build number (default: newest)")
+
+    s = add("completion", cmd_completion, "print a completion script for a shell", instance=False)
+    s.add_argument("shell", choices=("bash", "zsh", "fish"))
+
+    sub.add_parser("_viewer").set_defaults(fn=cmd_viewer, name="default", json=False)
     sub.choices["_viewer"].add_argument("-n", "--name", default="default")
 
     a = p.parse_args()
@@ -1744,14 +2161,25 @@ def main():
         p.error("apps install/run/remove/add need an app name or file")
     if a.cmd == "snapshot" and a.action != "list" and not a.tag:
         p.error("snapshot save/load/delete need a tag")
+    a.sub = sub
     try:
-        a.fn(a)
+        if a.json:
+            # Whatever the command prints for people goes to stderr; the result alone to stdout.
+            with contextlib.redirect_stdout(sys.stderr):
+                result = a.fn(a)
+            print(json.dumps({"ok": True} if result is None else result, indent=1))
+        else:
+            a.fn(a)
     except Fail as e:
         print(f"error: {e}", file=sys.stderr)
+        if a.json:
+            print(json.dumps({"ok": False, "error": str(e)}))
         notify(f"Error: {e}")
         sys.exit(1)
     except subprocess.TimeoutExpired as e:
         print(f"error: the guest did not answer within {e.timeout:.0f} s", file=sys.stderr)
+        if a.json:
+            print(json.dumps({"ok": False, "error": "the guest did not answer"}))
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)

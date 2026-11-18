@@ -1,0 +1,35 @@
+# Maintainer: VSHT3 <https://github.com/VSHT3>
+pkgname=f1emu-git
+pkgver=0.2.0.r0.g0000000
+pkgrel=1
+pkgdesc="Boots official Flipper One OS images in QEMU, with simulated hardware"
+arch=(any)
+url="https://github.com/VSHT3/flipper-one-emu"
+license=(GPL-3.0-or-later)
+depends=(python qemu-system-aarch64 qemu-img edk2-aarch64 zstd btrfs-progs openssh)
+makedepends=(git)
+optdepends=('libpulse: sound, through pactl'
+            'sshfs: show a folder of the device on the PC'
+            'xdg-utils: open the remote view in the browser')
+provides=(f1emu)
+conflicts=(f1emu)
+source=("f1emu::git+$url.git")
+sha256sums=(SKIP)
+
+pkgver() {
+  cd f1emu
+  printf '%s.r%s.g%s' "$(sed -n 's/^VERSION = "\(.*\)"/\1/p' f1emu)" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+  cd f1emu
+  # f1emu looks for sim/ next to itself, through the link in /usr/bin too.
+  install -Dm755 f1emu "$pkgdir/usr/lib/f1emu/f1emu"
+  cp -r sim "$pkgdir/usr/lib/f1emu/sim"
+  install -d "$pkgdir/usr/bin"
+  ln -s /usr/lib/f1emu/f1emu "$pkgdir/usr/bin/f1emu"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/f1emu/README.md"
+  install -d "$pkgdir/usr/share/bash-completion/completions" "$pkgdir/usr/share/fish/vendor_completions.d"
+  python f1emu completion bash > "$pkgdir/usr/share/bash-completion/completions/f1emu"
+  python f1emu completion fish > "$pkgdir/usr/share/fish/vendor_completions.d/f1emu.fish"
+}

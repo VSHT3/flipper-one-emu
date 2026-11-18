@@ -307,7 +307,10 @@
   const power = section('Power');
   const battery = slider('Battery', v => act('battery', v));
   const usbPick = choice(USB, plugUsb);
-  power.append(battery, row('USB-C1', usbPick));
+  // How fast the battery empties and fills with the power flow.
+  const clock = choice([['0', 'Level stays put'], ['1', 'Real time'], ['60', '60 times faster'], ['600', '600 times faster']],
+                       v => act('battery', '--speed', v));
+  power.append(battery, row('Time', clock), row('USB-C1', usbPick));
 
   const modem = section('5G modem');
   const signal = slider('Signal', v => act('modem', '--signal', v));
@@ -556,6 +559,7 @@
       sync(battery.input, state.level);
       if (document.activeElement !== battery.input) battery.value.textContent = state.level;
       sync(usbPick, cableIn);
+      sync(clock, String(state.speed));
     }
     modem.hidden = !has('modem');
     if (has('modem')) {

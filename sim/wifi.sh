@@ -7,7 +7,8 @@ D=/run/f1emu
 modprobe mac80211
 insmod $D/mac80211_hwsim.ko radios=5
 ip netns add f1sim
-ap() {  # ap RADIO SSID FREQ TXPOWER [PASSWORD]
+mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug
+ap() {  # ap RADIO SSID FREQ SIGNAL [PASSWORD]; SIGNAL is how strong it arrives, in dBm
   phy=$(basename "$(readlink /sys/class/net/wlan$1/phy80211)")
   iw phy "$phy" set netns name f1sim
   {
@@ -16,14 +17,17 @@ ap() {  # ap RADIO SSID FREQ TXPOWER [PASSWORD]
     printf '}\n'
   } > $D/ap$1.conf
   ip netns exec f1sim wpa_supplicant -B -i wlan$1 -c $D/ap$1.conf -P $D/ap$1.pid >/dev/null
-  ip netns exec f1sim iw dev wlan$1 set txpower fixed "$4" 2>/dev/null || true
+  # The simulator hands every frame over at the sender's `rx_rssi` plus its
+  # transmit power of 20 dBm. The file takes no minus sign, so the number goes
+  # in the way a negative one is stored.
+  printf '%u' $(($4 - 20)) > /sys/kernel/debug/ieee80211/$phy/hwsim/rx_rssi 2>/dev/null || true
   ip netns exec f1sim ip addr add 10.77.$1.1/24 dev wlan$1
   ip netns exec f1sim dnsmasq --interface=wlan$1 --bind-interfaces --except-interface=lo --no-resolv --port=0 \
     --dhcp-range=10.77.$1.10,10.77.$1.99,1h --dhcp-option=3 --dhcp-option=6 --pid-file=$D/dnsmasq$1.pid
 }
-ap 1 "Flipper Lab" 2412 2000 "flipperone"
-ap 2 "Coffee Shop Free WiFi" 2437 2000
-ap 3 "HomeNet" 2462 2000 "correct horse battery"
+ap 1 "Flipper Lab" 2412 -45 "flipperone"
+ap 2 "Coffee Shop Free WiFi" 2437 -65
+ap 3 "HomeNet" 2462 -78 "correct horse battery"
 
 # A pretend phone that joins "Flipper Lab" and rejoins every 40 seconds, so there
 # is always traffic, and a fresh WPA2 handshake, in the air to look at.

@@ -52,7 +52,7 @@ before sharing it with `--listen 0.0.0.0`.
 | `apps list\|install\|run\|remove` | The device's App Manager from the terminal |
 | `apps add FILE` | Copy your own `.fap.AppImage` or `.fap.py` into the device's app list |
 | `sim on [wifi battery modem laptop video]` | Load pretend hardware (see below); `sim status` shows it |
-| `sim battery LEVEL`, `sim usb none\|charger\|device\|laptop` | Set the battery, and what is plugged into USB-C1 |
+| `sim battery [LEVEL] [--speed N]`, `sim usb none\|charger\|device\|laptop` | Set the battery, how fast it empties and fills, and what is plugged into USB-C1 |
 | `sim modem --signal N --operator NAME --tech lte\|5gnr` | Set what the 5G modem screen reports |
 | `sim laptop on\|off\|run CMD` | A pretend laptop on ETH1 that gets its internet from the Flipper |
 | `sim pcap FILE [--seconds N]` | Capture the simulated Wi-Fi air, WPA2 handshakes included |
@@ -61,11 +61,46 @@ before sharing it with `--listen 0.0.0.0`.
 | `log [-f] [--journal]` | Boot console or systemd journal |
 | `snapshot save\|load\|delete\|list` | Snapshots. Of a stopped instance, its disk. Of a running one, disk and memory: `load` goes back to that moment without a boot |
 | `reset` | Factory reset one instance |
+| `upgrade [BUILD]` | Move an instance to another build, keeping `~/Files` and `~/Apps` |
+| `screen`, `wait screen [NAME]`, `wait app NAME` | What the device shows, as text; wait for it (see below) |
+| `test [--snapshot TAG] [--app FILE] [--run APP] [--keys KEY...]` | One throwaway run that keeps the screen and the log |
+| `mcp` | Offer the commands to an AI agent |
+| `completion bash\|zsh\|fish` | Print a shell completion script |
 | `builds [--remote]`, `fetch`, `profiles`, `rm-build` | Manage downloaded OS builds |
 | `desktop install\|remove` | Application-menu launcher |
 | `doctor`, `purge` | Check requirements; delete everything |
 
 Several instances can run side by side: `f1emu start -n second --build 2490`.
+
+## Scripts and AI agents
+
+Every command takes `--json`: the result goes to stdout as JSON, everything
+meant for people to stderr, and a failure is `{"ok": false, "error": ...}`
+with exit code 1.
+
+- `f1emu screen` reads flipctl's own log and reports the name of the screen
+  (`idle`, `menu`, `apps`), the last menu entry opened, the app in front and
+  the status line. flipctl does not log the words it draws, so for those a
+  script still needs `screenshot`.
+- `f1emu wait screen` returns when the panel's picture changes, `wait screen
+  menu` when that screen is shown, `wait app NAME` when the app is in front.
+  Menus slide in over about a second; the picture changes at the first frame
+  of that.
+- `f1emu test` boots a fresh instance of its own, copies in `--app` files,
+  starts `--run`, presses `--keys`, writes `screen.png`, `screen.json` and
+  `flipctl.log` to `--out`, and deletes the instance. `--snapshot TAG` starts
+  from the disk of a snapshot of the instance named with `-n`. It boots from
+  that disk; the snapshot's memory is not used.
+- `f1emu mcp` is a Model Context Protocol server on stdin and stdout with the
+  tools `status`, `start`, `stop`, `press`, `screen`, `screenshot`, `wait`,
+  `apps`, `sim`, `shell` and `test`. For Claude Code:
+  `claude mcp add f1emu -- f1emu mcp`. Exercised by hand with JSON-RPC lines,
+  not yet with an agent.
+- `ssh`, `press`, `screenshot`, `apps`, `screen` and `wait` take `--device
+  ADDRESS` and then talk to a real Flipper One instead: its remote view is
+  the same web server. Checked only against the emulated device's own port,
+  never against real hardware; `ssh`, `screen` and `wait` need your SSH key
+  on the device.
 
 Defaults can be set in `~/.config/flipper-one-emu/config.toml`:
 
@@ -88,19 +123,26 @@ view. The first use compiles a few kernel modules for the image's kernel,
 inside a throwaway instance; that takes a few minutes and is cached.
 
 - **Wi-Fi:** a virtual Wi-Fi card (`mac80211_hwsim`) and three access points
-  around it: `Flipper Lab` (WPA2, password `flipperone`), `Coffee Shop Free
-  WiFi` (open) and `HomeNet`. Scanning and connecting work as on a real card.
-  A pretend phone rejoins `Flipper Lab` every 40 seconds, so a capture always
-  has a handshake in it. Every signal is full strength.
-- **Battery and USB-C1:** a fake battery (`test_power`). The level, a charger,
-  or a device drawing power from the Flipper can be set; the OS shows the
-  matching power flow. `sim usb laptop` plugs in a computer: the OS brings up
-  its USB network link (`flipusb0`) and gives the laptop its address, as it
-  does on the real device. Sharing the internet over that link is added by
-  the simulator; the OS itself only provides the link.
+  around it: `Flipper Lab` (WPA2, password `flipperone`, strong), `Coffee
+  Shop Free WiFi` (open, medium) and `HomeNet` (WPA2, weak). Scanning and
+  connecting work as on a real card, from the device's own menu too. A
+  pretend phone rejoins `Flipper Lab` every 40 seconds, so a capture always
+  has a handshake in it.
+- **Battery and USB-C1:** a fake battery (`test_power`). It empties and fills
+  with the power flow, as a 22.9 Wh pack would; `--speed 60` makes that sixty
+  times faster, `--speed 0` keeps the level where it is set. The level, a
+  charger, or a device drawing power from the Flipper can be set; the OS
+  shows the matching power flow. `sim usb laptop` plugs in a computer: the OS
+  brings up its USB network link (`flipusb0`) and gives the laptop its
+  address, as it does on the real device. Sharing the internet over that
+  link is added by the simulator; the OS itself only provides the link.
 - **5G modem:** stand-ins for `mmcli`, `qmicli` and `nmcli` that answer the
-  Flipper's interface with made-up readings. The screens fill in; no data
-  flows. The RSRP line shows `lte` instead of a number.
+  Flipper's interface with made-up readings, and a pretend operator on the
+  far end of `wwan0`: data sent through it reaches the internet (by way of
+  the Flipper's own Ethernet), and the route is the last choice, as a
+  modem's is. The RSRP line shows `lte` instead of a number. The stand-in
+  prints what the real `qmicli` prints, so this looks like flipctl's
+  reading of it; unconfirmed without a real modem.
 - **Laptop on ETH1:** a second machine on a virtual cable. The Flipper shares
   its connection with it, and `sim laptop run` runs commands on it.
 - **Video output:** every instance has a screen, a keyboard and a pointer on
@@ -155,9 +197,11 @@ LoRa and the other radios are not simulated: nothing in the OS shows them.
   up but untested.
 - Sound works by tunnelling the guest's PipeWire to the PC's sound server,
   not through an emulated sound card. The microphone is off unless asked for.
-- Without `sim`, there is no Wi-Fi, modem or battery. GPIO and USB are never
-  there: the kernel has no driver for any USB controller QEMU can emulate.
-  Ethernet works through NAT.
+- Without `sim`, there is no Wi-Fi, modem or battery. USB is never there:
+  the kernel has no driver for any USB controller QEMU can emulate. GPIO
+  cannot be simulated either: the kernel's `gpio-sim` needs the interrupt
+  simulator, which Flipper's kernel is built without and which cannot be
+  loaded as a module. Ethernet works through NAT.
 - The Router profile boots, but its remote view and SSH do not answer
   through QEMU's network.
 - The vendor 6.1 kernel has no virtio drivers, so the mainline kernel is used.
