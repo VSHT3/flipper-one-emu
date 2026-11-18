@@ -2,6 +2,8 @@
 
 Runs Flipper One OS on a Linux PC in QEMU. No root.
 
+![The remote view: the device with a charger and two network cables plugged in, and the column of controls](docs/remote-view.jpg)
+
 It downloads an official Flipper OS image, reads the kernel out of it, boots
 it and opens the device's remote view in a browser. The OS, menus, App
 Manager and apps come from the image unmodified; only the hardware is
@@ -39,6 +41,12 @@ The column on its right holds what the emulator adds: the simulated
 hardware, the video output, screenshots, snapshots, factory reset and shut
 down. It runs commands in the guest for whoever can open the page, so think
 before sharing it with `--listen 0.0.0.0`.
+
+![The device's menu, as saved by `f1emu screenshot`](docs/panel-menu.png)
+
+The menu's **Testing: flipctl2** entry swaps the device's interface, and with
+it the page, for Flipper's test version, which has none of the above. To get
+back: `f1emu ssh --root -- 'systemctl stop fake-flipctl-node-server; systemctl start flipctl'`.
 
 | Command | What it does |
 |---|---|

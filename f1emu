@@ -1466,6 +1466,11 @@ def cmd_sim(a):
             if not first.isdigit() or not 0 <= int(first) <= 100:
                 raise Fail("the battery level is a number from 0 to 100")
             sets.append(f"echo {first} > battery_capacity")
+            if int(first) < 100:
+                # A battery that was full took no current; no longer full, it
+                # takes again what the source in USB-C1 gives.
+                sets.append("{ c=$(cat /run/f1emu/cable_current); [ \"$c\" -le 0 ] || "
+                            "{ echo charging > battery_status && echo $c > battery_current; }; }")
         if a.charging or a.discharging:
             sets.append(f"echo {'on' if a.charging else 'off'} > ac_online")
             sets.append(f"echo {'charging' if a.charging else 'discharging'} > battery_status")
