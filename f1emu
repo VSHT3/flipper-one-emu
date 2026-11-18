@@ -525,16 +525,25 @@ def credentials(pubkey):
     lives in /run, and is written before polkit starts, which is the only time
     polkit looks there.
 
+    The network profile is for the Router profile of the OS. Its own profile for
+    the uplink is tied to the device's WAN port by name, QEMU's card is called
+    eth0, and so it got no address and nothing could reach the guest. This
+    one asks for an address on eth0 whenever the OS has no profile of its own.
+
     On the kernel command line because this kernel has neither dmi-sysfs nor
     fw_cfg, the two channels systemd reads QEMU-supplied credentials from.
     """
     rule = ('polkit.addRule(function(action, subject) { if (subject.user == "user" && '
             'action.id.indexOf("org.freedesktop.NetworkManager.") == 0) return polkit.Result.YES; });')
+    wired = (r"[connection]\nid=f1emu uplink\ntype=ethernet\ninterface-name=eth0\nautoconnect-priority=-100\n"
+             r"[ipv4]\nmethod=auto\n[ipv6]\nmethod=auto\n")
     tmpfiles = (
         "d /home/user/.ssh 0700 user user -\n"
         f"f /home/user/.ssh/authorized_keys 0600 user user - {pubkey}\n"
         "d /run/polkit-1/rules.d 0755 root root -\n"
         f"f /run/polkit-1/rules.d/49-f1emu.rules 0644 root root - {rule}\n"
+        "d /run/NetworkManager/system-connections 0755 root root -\n"
+        f"f /run/NetworkManager/system-connections/f1emu-uplink.nmconnection 0600 root root - {wired}\n"
     )
     creds = {
         "ssh.authorized_keys.root": pubkey.encode(),
@@ -557,7 +566,15 @@ def qemu_command(inst, meta, entry, boot, opts):
         # Emulating pointer authentication is the single most expensive CPU feature
         # under TCG: with it off, boot went from 21 s to 17 s and a Python loop in
         # the guest from 7.7 s to 3.1 s on the machine this was measured on.
-        machine = ["-M", "virt,acpi=off", "-accel", "tcg,thread=multi", "-cpu", "max,pauth=off"]
+        # QEMU 8.2 cannot be given `max`: about half its boots of this kernel stop
+        # dead before the first console line, both CPUs spinning in the kernel
+        # (measured on Ubuntu 24.04's 8.2.2: 20 of 36 boots hung with `max`, none
+        # of 24 with a named model). QEMU 11 boots `max` every time and ten
+        # seconds sooner than a named model. Untested in between, so only 11 and
+        # later get `max`.
+        version = re.search(r"version (\d+)", run(["qemu-system-aarch64", "--version"]).stdout)
+        cpu = "max,pauth=off" if version and int(version.group(1)) >= 11 else "cortex-a72"
+        machine = ["-M", "virt,acpi=off", "-accel", "tcg,thread=multi", "-cpu", cpu]
     # The Flipper kernel is device-tree only: with ACPI tables present it finds no
     # timer and panics, hence acpi=off. hvc0 is listed last so systemd logs there.
     append = (f"root=UUID={meta['fsid']} rootflags=subvol=@{entry['profile']} rw rootwait "

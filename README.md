@@ -196,14 +196,17 @@ LoRa and the other radios are not simulated: nothing in the OS shows them.
 - On x86 the ARM CPU is emulated in software. KVM on an ARM64 host is wired
   up but untested.
 - Sound works by tunnelling the guest's PipeWire to the PC's sound server,
-  not through an emulated sound card. The microphone is off unless asked for.
+  not through an emulated sound card. The microphone is off unless asked for;
+  with `--mic` the guest gets a source it can record from, which was checked
+  with a silent one only.
 - Without `sim`, there is no Wi-Fi, modem or battery. USB is never there:
   the kernel has no driver for any USB controller QEMU can emulate. GPIO
   cannot be simulated either: the kernel's `gpio-sim` needs the interrupt
   simulator, which Flipper's kernel is built without and which cannot be
   loaded as a module. Ethernet works through NAT.
-- The Router profile boots, but its remote view and SSH do not answer
-  through QEMU's network.
+- The Router profile boots and answers. Its LAN side has nothing on it: the
+  second Ethernet port and the access points it wants do not exist here, so
+  three of its services fail at boot.
 - The vendor 6.1 kernel has no virtio drivers, so the mainline kernel is used.
 - Flipper publishes development builds several times a day and the image
   layout can change. Pin `build` in the config if a new one breaks.
